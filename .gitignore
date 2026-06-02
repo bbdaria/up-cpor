@@ -747,5 +747,5 @@ $RECYCLE.BIN/
 
 # Windows shortcuts
 *.lnk
-build/*
+up-cpor-cpp-rewrite/build/*
 # End of https://www.toptal.com/developers/gitignore/api/python,visualstudiocode,macos,windows,linux,csharp,pycharm+all
