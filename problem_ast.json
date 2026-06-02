@@ -1,0 +1,92 @@
+{
+    "problem_name": "bw-rand-3",
+    "actions": [
+        {
+            "name": "senseon",
+            "is_sensing": true,
+            "parameters": [
+                "b1",
+                "b2"
+            ],
+            "preconditions": [],
+            "effects": [],
+            "observed_fluents": [
+                "on(b1, b2)"
+            ]
+        },
+        {
+            "name": "senseclear",
+            "is_sensing": true,
+            "parameters": [
+                "b1"
+            ],
+            "preconditions": [],
+            "effects": [],
+            "observed_fluents": [
+                "clear(b1)"
+            ]
+        },
+        {
+            "name": "senseontable",
+            "is_sensing": true,
+            "parameters": [
+                "b1"
+            ],
+            "preconditions": [],
+            "effects": [],
+            "observed_fluents": [
+                "on-table(b1)"
+            ]
+        },
+        {
+            "name": "move-b-to-b",
+            "is_sensing": false,
+            "parameters": [
+                "bm",
+                "bf",
+                "bt"
+            ],
+            "preconditions": [
+                "(clear(bm) and clear(bt) and on(bm, bf) and (not same(bm, bt)))"
+            ],
+            "effects": [
+                "clear(bt) := false",
+                "on(bm, bf) := false",
+                "on(bm, bt) := true",
+                "clear(bf) := true"
+            ]
+        },
+        {
+            "name": "move-to-t",
+            "is_sensing": false,
+            "parameters": [
+                "b",
+                "bf"
+            ],
+            "preconditions": [
+                "(clear(b) and on(b, bf))"
+            ],
+            "effects": [
+                "on-table(b) := true",
+                "on(b, bf) := false",
+                "clear(bf) := true"
+            ]
+        },
+        {
+            "name": "move-t-to-b",
+            "is_sensing": false,
+            "parameters": [
+                "bm",
+                "bt"
+            ],
+            "preconditions": [
+                "(clear(bm) and clear(bt) and on-table(bm) and (not same(bm, bt)))"
+            ],
+            "effects": [
+                "clear(bt) := false",
+                "on-table(bm) := false",
+                "on(bm, bt) := true"
+            ]
+        }
+    ]
+}
