@@ -7,7 +7,9 @@ private:
     FormulaList operands_;
 
 public:
-    AndNode() { this->size_ = 1; }
+    AndNode() : Formula(), operands_({}) {
+            this->size_ = 1; 
+        } 
     explicit AndNode(FormulaList operands);
     using Formula::is_true;
     using Formula::is_false;

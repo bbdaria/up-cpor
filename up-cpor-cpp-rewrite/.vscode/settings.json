@@ -1,0 +1,6 @@
+{
+    "python.analysis.extraPaths": [
+        "${workspaceFolder}/build"
+    ],
+    "python.defaultInterpreterPath": "/opt/miniconda3/envs/up_cpor_env/bin/python"
+}

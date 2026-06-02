@@ -6,6 +6,10 @@ private:
     std::shared_ptr<Formula> child_;
 
 public:
+    NotNode() : Formula() {
+        this->child_ = nullptr;
+        this->size_ = 0; 
+    }
     explicit NotNode(std::shared_ptr<Formula> child) : child_(std::move(child)) {
         this->size_ = 1 + (child_ ? child_->get_size() : 0);
     }

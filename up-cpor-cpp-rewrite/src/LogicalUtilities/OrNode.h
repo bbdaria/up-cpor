@@ -7,7 +7,9 @@ private:
     FormulaList operands_;
 
 public:
-    OrNode() { this->size_ = 1; }
+    OrNode() : Formula(), operands_({}) {
+            this->size_ = 1; 
+        } 
     explicit OrNode(FormulaList operands);
     using Formula::is_true;
     using Formula::is_false;
