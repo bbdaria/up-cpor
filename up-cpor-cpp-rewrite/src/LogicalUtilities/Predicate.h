@@ -87,3 +87,5 @@ struct PredicatePtrEqual {
         return *lhs == *rhs;
     }
 };
+
+using PredicateSet = std::unordered_set<std::shared_ptr<Predicate>, PredicatePtrHash, PredicatePtrEqual>;

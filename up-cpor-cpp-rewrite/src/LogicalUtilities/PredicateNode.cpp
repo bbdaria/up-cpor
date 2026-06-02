@@ -1,3 +1,4 @@
+#include "Predicate.h"
 #include "PredicateNode.h"
 #include <stdexcept>
 #include <algorithm>
@@ -7,14 +8,14 @@ PredicateNode::PredicateNode(std::shared_ptr<Predicate> predicate)
     this->size_ = 1;
 }
 
-static bool contains_predicate(const std::unordered_set<std::shared_ptr<Predicate>>& collection, const Predicate& target) {
+static bool contains_predicate(const PredicateSet& collection, const Predicate& target) {
     for (const auto& item : collection) {
         if (item && *item == target) return true;
     }
     return false;
 }
 
-bool PredicateNode::is_true(const std::unordered_set<std::shared_ptr<Predicate>>& known, bool contains_negations) const {
+bool PredicateNode::is_true(const PredicateSet& known, bool contains_negations) const {
     if (!predicate_) return false;
 
     if (!contains_negations) {
@@ -32,7 +33,7 @@ bool PredicateNode::is_true(const std::unordered_set<std::shared_ptr<Predicate>>
     return contains_predicate(known, *predicate_);
 }
 
-bool PredicateNode::is_false(const std::unordered_set<std::shared_ptr<Predicate>>& known, bool contains_negations) const {
+bool PredicateNode::is_false(const PredicateSet& known, bool contains_negations) const {
     if (!predicate_) return true;
 
     if (!contains_negations) {
@@ -53,7 +54,7 @@ bool PredicateNode::is_false(const std::unordered_set<std::shared_ptr<Predicate>
     return contains_predicate(known, *negated);
 }
 
-bool PredicateNode::is_true_delete_relaxation(const std::unordered_set<std::shared_ptr<Predicate>>& known) const {
+bool PredicateNode::is_true_delete_relaxation(const PredicateSet& known) const {
     if (predicate_->is_negated()) return true;
     return is_true(known, false);
 }
@@ -70,12 +71,12 @@ std::shared_ptr<Formula> PredicateNode::negate() {
     return std::make_shared<PredicateNode>(predicate_->negate());
 }
 
-void PredicateNode::get_all_predicates(std::unordered_set<std::shared_ptr<Predicate>>& predicates) const {
+void PredicateNode::get_all_predicates(PredicateSet& predicates) const {
     predicates.insert(predicate_);
 }
 
-void PredicateNode::get_all_effect_predicates(std::unordered_set<std::shared_ptr<Predicate>>& conditional_predicates, 
-                                               std::unordered_set<std::shared_ptr<Predicate>>& non_conditional_predicates) const {
+void PredicateNode::get_all_effect_predicates(PredicateSet& conditional_predicates, 
+                                               PredicateSet& non_conditional_predicates) const {
     non_conditional_predicates.insert(predicate_);
 }
 
@@ -87,7 +88,7 @@ std::shared_ptr<Formula> PredicateNode::clone() const {
     return std::make_shared<PredicateNode>(predicate_);
 }
 
-bool PredicateNode::contained_in(const std::unordered_set<std::shared_ptr<Predicate>>& predicates, bool contains_negations) const {
+bool PredicateNode::contained_in(const PredicateSet& predicates, bool contains_negations) const {
     if (!contains_negations) {
         if (predicate_->is_negated()) {
             return true;
@@ -113,7 +114,7 @@ std::shared_ptr<Formula> PredicateNode::simplify() {
     return clone();
 }
 
-std::shared_ptr<Formula> PredicateNode::regress(std::shared_ptr<PlanningAction> a, const std::unordered_set<std::shared_ptr<Predicate>>& observed) {
+std::shared_ptr<Formula> PredicateNode::regress(std::shared_ptr<PlanningAction> a, const PredicateSet& observed) {
     return clone();
 }
 
@@ -121,7 +122,7 @@ std::shared_ptr<Formula> PredicateNode::regress(std::shared_ptr<PlanningAction> 
     return clone();
 }
 
-std::shared_ptr<Formula> PredicateNode::reduce(const std::unordered_set<std::shared_ptr<Predicate>>& known) {
+std::shared_ptr<Formula> PredicateNode::reduce(const PredicateSet& known) {
     if (contains_predicate(known, *predicate_)) {
         return std::make_shared<PredicateNode>(Utilities::TRUE_PREDICATE);
     }
@@ -131,7 +132,7 @@ std::shared_ptr<Formula> PredicateNode::reduce(const std::unordered_set<std::sha
     return clone();
 }
 
-void PredicateNode::get_all_optional_predicates(std::unordered_set<std::shared_ptr<Predicate>>& predicates) const {
+void PredicateNode::get_all_optional_predicates(PredicateSet& predicates) const {
 }
 
 std::shared_ptr<Formula> PredicateNode::create_regression(std::shared_ptr<Predicate> pred, int choice) {
@@ -153,11 +154,11 @@ std::shared_ptr<Formula> PredicateNode::replace_negative_effects_in_condition() 
     return clone();
 }
 
-std::shared_ptr<Formula> PredicateNode::remove_impossible_options(const std::unordered_set<std::shared_ptr<Predicate>>& observed) {
+std::shared_ptr<Formula> PredicateNode::remove_impossible_options(const PredicateSet& observed) {
     return clone();
 }
 
-std::shared_ptr<Formula> PredicateNode::apply_known(const std::unordered_set<std::shared_ptr<Predicate>>& known) {
+std::shared_ptr<Formula> PredicateNode::apply_known(const PredicateSet& known) {
     return reduce(known);
 }
 
@@ -181,7 +182,7 @@ std::shared_ptr<Formula> PredicateNode::get_knowledge_formula(const std::vector<
     return std::make_shared<PredicateNode>(Predicate::generate_know_predicate(predicate_));
 }
 
-std::shared_ptr<Formula> PredicateNode::reduce_conditions(const std::unordered_set<std::shared_ptr<Predicate>>& known) {
+std::shared_ptr<Formula> PredicateNode::reduce_conditions(const PredicateSet& known) {
     return reduce(known);
 }
 

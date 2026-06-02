@@ -1,3 +1,4 @@
+#include "Predicate.h"
 #include "AndNode.h"
 #include "OrNode.h"
 #include "NotNode.h"
@@ -20,21 +21,21 @@ void AndNode::add_operand(FormulaPtr operand) {
     }
 }
 
-bool AndNode::is_true(const std::unordered_set<std::shared_ptr<Predicate>>& known, bool contains_negations) const {
+bool AndNode::is_true(const PredicateSet& known, bool contains_negations) const {
     for (const auto& op : operands_) {
         if (op && !op->is_true(known, contains_negations)) return false; // Short-circuit
     }
     return true;
 }
 
-bool AndNode::is_false(const std::unordered_set<std::shared_ptr<Predicate>>& known, bool contains_negations) const {
+bool AndNode::is_false(const PredicateSet& known, bool contains_negations) const {
     for (const auto& op : operands_) {
         if (op && op->is_false(known, contains_negations)) return true; // Short-circuit if one item is definitely false
     }
     return false;
 }
 
-bool AndNode::is_true_delete_relaxation(const std::unordered_set<std::shared_ptr<Predicate>>& known) const {
+bool AndNode::is_true_delete_relaxation(const PredicateSet& known) const {
     for (const auto& op : operands_) {
         if (op && !op->is_true_delete_relaxation(known)) return false;
     }
@@ -50,14 +51,14 @@ std::shared_ptr<Formula> AndNode::negate() {
     return std::make_shared<OrNode>(negated_ops);
 }
 
-void AndNode::get_all_predicates(std::unordered_set<std::shared_ptr<Predicate>>& predicates) const {
+void AndNode::get_all_predicates(PredicateSet& predicates) const {
     for (const auto& op : operands_) {
         if (op) op->get_all_predicates(predicates);
     }
 }
 
-void AndNode::get_all_effect_predicates(std::unordered_set<std::shared_ptr<Predicate>>& conditional_predicates, 
-                                       std::unordered_set<std::shared_ptr<Predicate>>& non_conditional_predicates) const {
+void AndNode::get_all_effect_predicates(PredicateSet& conditional_predicates, 
+                                       PredicateSet& non_conditional_predicates) const {
     for (const auto& op : operands_) {
         if (op) op->get_all_effect_predicates(conditional_predicates, non_conditional_predicates);
     }
@@ -78,7 +79,7 @@ std::shared_ptr<Formula> AndNode::clone() const {
     return std::make_shared<AndNode>(cloned_ops);
 }
 
-bool AndNode::contained_in(const std::unordered_set<std::shared_ptr<Predicate>>& predicates, bool contains_negations) const {
+bool AndNode::contained_in(const PredicateSet& predicates, bool contains_negations) const {
     for (const auto& op : operands_) {
         if (op && !op->contained_in(predicates, contains_negations)) return false;
     }
@@ -126,7 +127,7 @@ std::shared_ptr<Formula> AndNode::simplify() {
     return std::make_shared<AndNode>(final_ops);
 }
 
-std::shared_ptr<Formula> AndNode::reduce(const std::unordered_set<std::shared_ptr<Predicate>>& known) {
+std::shared_ptr<Formula> AndNode::reduce(const PredicateSet& known) {
     FormulaList reduced_ops;
     for (const auto& op : operands_) {
         if (op) reduced_ops.push_back(op->reduce(known));
@@ -149,21 +150,21 @@ std::string AndNode::to_string() const {
 std::shared_ptr<Formula> AndNode::ground(const std::unordered_map<std::shared_ptr<Parameter>, std::shared_ptr<Constant>>& bindings) { return clone(); }
 std::shared_ptr<Formula> AndNode::partially_ground(const std::unordered_map<std::shared_ptr<Parameter>, std::shared_ptr<Constant>>& bindings) { return clone(); }
 std::shared_ptr<Formula> AndNode::to_cnf() { return clone(); }
-std::shared_ptr<Formula> AndNode::regress(std::shared_ptr<PlanningAction> a, const std::unordered_set<std::shared_ptr<Predicate>>& observed) { return clone(); }
+std::shared_ptr<Formula> AndNode::regress(std::shared_ptr<PlanningAction> a, const PredicateSet& observed) { return clone(); }
 std::shared_ptr<Formula> AndNode::regress(std::shared_ptr<PlanningAction> a) { return clone(); }
 bool AndNode::contains_non_deterministic_effect() const { return false; }
 int AndNode::get_max_non_deterministic_options() const { return 1; }
-void AndNode::get_all_optional_predicates(std::unordered_set<std::shared_ptr<Predicate>>& predicates) const {}
+void AndNode::get_all_optional_predicates(PredicateSet& predicates) const {}
 std::shared_ptr<Formula> AndNode::create_regression(std::shared_ptr<Predicate> pred, int choice) { return clone(); }
 std::shared_ptr<Formula> AndNode::generate_given(const std::string& tag, const std::vector<std::string>& always_known) { return clone(); }
 std::shared_ptr<Formula> AndNode::add_time(int time) { return clone(); }
 std::shared_ptr<Formula> AndNode::replace_negative_effects_in_condition() { return clone(); }
-std::shared_ptr<Formula> AndNode::remove_impossible_options(const std::unordered_set<std::shared_ptr<Predicate>>& observed) { return clone(); }
-std::shared_ptr<Formula> AndNode::apply_known(const std::unordered_set<std::shared_ptr<Predicate>>& known) { return reduce(known); }
+std::shared_ptr<Formula> AndNode::remove_impossible_options(const PredicateSet& observed) { return clone(); }
+std::shared_ptr<Formula> AndNode::apply_known(const PredicateSet& known) { return reduce(known); }
 std::vector<std::shared_ptr<Predicate>> AndNode::get_non_deterministic_effects() { return {}; }
 std::shared_ptr<Formula> AndNode::remove_universal_quantifiers(const std::vector<std::shared_ptr<Constant>>& constants, const std::vector<std::shared_ptr<Predicate>>& constant_predicates, std::shared_ptr<Domain> d) { return clone(); }
 std::shared_ptr<Formula> AndNode::get_knowledge_formula(const std::vector<std::string>& always_known, bool know_whether) { return clone(); }
-std::shared_ptr<Formula> AndNode::reduce_conditions(const std::unordered_set<std::shared_ptr<Predicate>>& known) { return reduce(known); }
+std::shared_ptr<Formula> AndNode::reduce_conditions(const PredicateSet& known) { return reduce(known); }
 std::shared_ptr<Formula> AndNode::remove_negations() {
     FormulaList clean_ops;
     for (const auto& op : operands_) {

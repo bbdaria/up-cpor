@@ -1,3 +1,4 @@
+#include "Predicate.h"
 #include "OrNode.h"
 #include "AndNode.h"
 #include "NotNode.h"
@@ -10,14 +11,14 @@ OrNode::OrNode(FormulaList operands) : operands_(std::move(operands)) {
     for (const auto& op : operands_) if (op) this->size_ += op->get_size();
 }
 
-bool OrNode::is_true(const std::unordered_set<std::shared_ptr<Predicate>>& known, bool contains_negations) const {
+bool OrNode::is_true(const PredicateSet& known, bool contains_negations) const {
     for (const auto& op : operands_) {
         if (op && op->is_true(known, contains_negations)) return true; // Short-circuit
     }
     return false;
 }
 
-bool OrNode::is_false(const std::unordered_set<std::shared_ptr<Predicate>>& known, bool contains_negations) const {
+bool OrNode::is_false(const PredicateSet& known, bool contains_negations) const {
     for (const auto& op : operands_) {
         if (op && !op->is_false(known, contains_negations)) return false;
     }
@@ -25,7 +26,7 @@ bool OrNode::is_false(const std::unordered_set<std::shared_ptr<Predicate>>& know
 }
 
 
-bool OrNode::is_true_delete_relaxation(const std::unordered_set<std::shared_ptr<Predicate>>& known) const {
+bool OrNode::is_true_delete_relaxation(const PredicateSet& known) const {
     for (const auto& op : operands_) {
         if (op && op->is_true_delete_relaxation(known)) return true;
     }
@@ -68,14 +69,14 @@ std::shared_ptr<Formula> OrNode::simplify() {
     return std::make_shared<OrNode>(final_ops);
 }
 
-void OrNode::get_all_predicates(std::unordered_set<std::shared_ptr<Predicate>>& predicates) const {
+void OrNode::get_all_predicates(PredicateSet& predicates) const {
     for (const auto& op : operands_) {
         if (op) op->get_all_predicates(predicates);
     }
 }
 
-void OrNode::get_all_effect_predicates(std::unordered_set<std::shared_ptr<Predicate>>& conditional_predicates, 
-                                       std::unordered_set<std::shared_ptr<Predicate>>& non_conditional_predicates) const {
+void OrNode::get_all_effect_predicates(PredicateSet& conditional_predicates, 
+                                       PredicateSet& non_conditional_predicates) const {
     for (const auto& op : operands_) {
         if (op) op->get_all_effect_predicates(conditional_predicates, non_conditional_predicates);
     }
@@ -96,7 +97,7 @@ std::shared_ptr<Formula> OrNode::clone() const {
     return std::make_shared<OrNode>(cloned_ops);
 }
 
-bool OrNode::contained_in(const std::unordered_set<std::shared_ptr<Predicate>>& predicates, bool contains_negations) const {
+bool OrNode::contained_in(const PredicateSet& predicates, bool contains_negations) const {
     for (const auto& op : operands_) {
         if (op && op->contained_in(predicates, contains_negations)) return true;
     }
@@ -112,7 +113,7 @@ std::shared_ptr<Formula> OrNode::replace(std::shared_ptr<Formula> org_f, std::sh
     return std::make_shared<OrNode>(replaced_ops);
 }
 
-std::shared_ptr<Formula> OrNode::reduce(const std::unordered_set<std::shared_ptr<Predicate>>& known) {
+std::shared_ptr<Formula> OrNode::reduce(const PredicateSet& known) {
     FormulaList reduced_ops;
     for (const auto& op : operands_) {
         if (op) reduced_ops.push_back(op->reduce(known));
@@ -134,21 +135,21 @@ std::string OrNode::to_string() const {
 std::shared_ptr<Formula> OrNode::ground(const std::unordered_map<std::shared_ptr<Parameter>, std::shared_ptr<Constant>>& bindings) { return clone(); }
 std::shared_ptr<Formula> OrNode::partially_ground(const std::unordered_map<std::shared_ptr<Parameter>, std::shared_ptr<Constant>>& bindings) { return clone(); }
 std::shared_ptr<Formula> OrNode::to_cnf() { return clone(); }
-std::shared_ptr<Formula> OrNode::regress(std::shared_ptr<PlanningAction> a, const std::unordered_set<std::shared_ptr<Predicate>>& observed) { return clone(); }
+std::shared_ptr<Formula> OrNode::regress(std::shared_ptr<PlanningAction> a, const PredicateSet& observed) { return clone(); }
 std::shared_ptr<Formula> OrNode::regress(std::shared_ptr<PlanningAction> a) { return clone(); }
 bool OrNode::contains_non_deterministic_effect() const { return false; }
 int OrNode::get_max_non_deterministic_options() const { return 1; }
-void OrNode::get_all_optional_predicates(std::unordered_set<std::shared_ptr<Predicate>>& predicates) const {}
+void OrNode::get_all_optional_predicates(PredicateSet& predicates) const {}
 std::shared_ptr<Formula> OrNode::create_regression(std::shared_ptr<Predicate> pred, int choice) { return clone(); }
 std::shared_ptr<Formula> OrNode::generate_given(const std::string& tag, const std::vector<std::string>& always_known) { return clone(); }
 std::shared_ptr<Formula> OrNode::add_time(int time) { return clone(); }
 std::shared_ptr<Formula> OrNode::replace_negative_effects_in_condition() { return clone(); }
-std::shared_ptr<Formula> OrNode::remove_impossible_options(const std::unordered_set<std::shared_ptr<Predicate>>& observed) { return clone(); }
-std::shared_ptr<Formula> OrNode::apply_known(const std::unordered_set<std::shared_ptr<Predicate>>& known) { return reduce(known); }
+std::shared_ptr<Formula> OrNode::remove_impossible_options(const PredicateSet& observed) { return clone(); }
+std::shared_ptr<Formula> OrNode::apply_known(const PredicateSet& known) { return reduce(known); }
 std::vector<std::shared_ptr<Predicate>> OrNode::get_non_deterministic_effects() { return {}; }
 std::shared_ptr<Formula> OrNode::remove_universal_quantifiers(const std::vector<std::shared_ptr<Constant>>& constants, const std::vector<std::shared_ptr<Predicate>>& constant_predicates, std::shared_ptr<Domain> d) { return clone(); }
 std::shared_ptr<Formula> OrNode::get_knowledge_formula(const std::vector<std::string>& always_known, bool know_whether) { return clone(); }
-std::shared_ptr<Formula> OrNode::reduce_conditions(const std::unordered_set<std::shared_ptr<Predicate>>& known) { return reduce(known); }
+std::shared_ptr<Formula> OrNode::reduce_conditions(const PredicateSet& known) { return reduce(known); }
 std::shared_ptr<Formula> OrNode::remove_negations() {
     FormulaList clean_ops;
     for (const auto& op : operands_) {

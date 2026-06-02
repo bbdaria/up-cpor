@@ -2,22 +2,25 @@
 #include <string>
 #include <vector>
 #include <iostream>
+#include <memory>
 
+class Formula;
+class Predicate;
 struct PlanningAction {
     std::string name;
     bool is_sensing;
-    std::vector<std::string> preconditions;
-    std::vector<std::string> effects;
-    std::vector<std::string> observed_fluents;
+
+    std::shared_ptr<Formula> precondition;
+    std::shared_ptr<Formula> effect;
+    std::vector<std::shared_ptr<Predicate>> observed_fluents;
 
     void debug_print() const {
         std::cout << "Action: " << name 
                   << " | Sensing: " << (is_sensing ? "True" : "False") 
-                  << " | Preconds: " << preconditions.size() 
-                  << " | Effects: " << effects.size() << "\n";
+                  << " | Preconds: " << (precondition ? "Defined" : "None") 
+                  << " | Effects: " << (effect ? "Defined" : "None") << "\n";
     }
 };
-
 struct ProblemContext {
     std::string problem_name;
     std::vector<PlanningAction> actions;
