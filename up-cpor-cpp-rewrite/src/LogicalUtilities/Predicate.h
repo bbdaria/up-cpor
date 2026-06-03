@@ -3,6 +3,8 @@
 #include <string>
 #include <vector>
 #include <sstream>
+#include <unordered_set>
+#include <memory>
 
 class Predicate {
 private:

@@ -13,12 +13,12 @@ class CPORMetaPlanner:
 
     def build_plan_graph(self, belief_state) -> ContingentPlanNode:
         # 1. Cycle Detection (Memoize graph nodes to handle non-determinism/loops)
-        bs_hash = hash(frozenset(belief_state)) 
+        bs_hash = tuple(sorted([p.get_name() for p in belief_state.get_observed()]))
         if bs_hash in self.visited_beliefs:
             return self.visited_beliefs[bs_hash]
 
         # 2. Check Goal State
-        if self.simulator.is_goal(belief_state):
+        if self.compiled_goal_ast.is_true(belief_state.get_observed()):
             return None # Reached goal, terminate branch
 
         # 3. Online Planner Query

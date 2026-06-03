@@ -16,6 +16,8 @@ add_library(cpor_core STATIC
     src/LogicalUtilities/PredicateNode.cpp
     src/LogicalUtilities/AndNode.cpp
     src/LogicalUtilities/OrNode.cpp
+    src/PlanningModel/BeliefState.cpp  # <-- ADDED
+    src/PlanningModel/State.cpp        # <-- ADDED
 )
 target_include_directories(cpor_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
@@ -40,4 +42,5 @@ FetchContent_MakeAvailable(Catch2)
 
 # Point Catch2 to your C++ test file
 add_executable(run_tests tests/cpp/test_logical_utils.cpp)
-target_link_libraries(run_tests PRIVATE cpor_core Catch2::Catch2WithMain)
+target_link_libraries(run_tests PRIVATE 
+cpor_core Catch2::Catch2WithMain)

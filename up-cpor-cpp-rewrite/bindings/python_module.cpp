@@ -10,7 +10,8 @@
 #include "LogicalUtilities/AndNode.h"
 #include "LogicalUtilities/OrNode.h"
 #include "LogicalUtilities/NotNode.h"
-#include "PlanningModel/Action.h" // Assuming this is the correct path in your setup
+#include "PlanningModel/Action.h" 
+#include "PlanningModel/BeliefState.h"
 
 // 1. Module Definition
 static struct PyModuleDef cpor_engine_module = {
@@ -24,6 +25,7 @@ static PyTypeObject PyAndNodeType = { PyVarObject_HEAD_INIT(NULL, 0) };
 static PyTypeObject PyOrNodeType = { PyVarObject_HEAD_INIT(NULL, 0) };
 static PyTypeObject PyNotNodeType = { PyVarObject_HEAD_INIT(NULL, 0) };
 static PyTypeObject PyActionType = { PyVarObject_HEAD_INIT(NULL, 0) };
+static PyTypeObject PyBeliefStateType = { PyVarObject_HEAD_INIT(NULL, 0) };
 
 typedef struct { PyObject_HEAD std::shared_ptr<Predicate>* cpp_obj; } PyPredicate;
 typedef struct { PyObject_HEAD std::shared_ptr<PredicateNode>* cpp_obj; } PyPredicateNode;
@@ -31,6 +33,7 @@ typedef struct { PyObject_HEAD std::shared_ptr<AndNode>* cpp_obj; } PyAndNode;
 typedef struct { PyObject_HEAD std::shared_ptr<OrNode>* cpp_obj; } PyOrNode;
 typedef struct { PyObject_HEAD std::shared_ptr<NotNode>* cpp_obj; } PyNotNode;
 typedef struct { PyObject_HEAD std::shared_ptr<Action>* cpp_obj; } PyAction;
+typedef struct { PyObject_HEAD std::shared_ptr<BeliefState>* cpp_obj; } PyBeliefState;
 
 // 3. Init Functions (Allocation)
 static int PyPredicate_init(PyPredicate* self, PyObject* args, PyObject* kwds) { 
@@ -77,7 +80,7 @@ static PyObject* ASTNode_is_true(PyObject* self, PyObject* args) {
     PyObject* py_list;
     if (!PyArg_ParseTuple(args, "O", &py_list)) return NULL;
     
-    std::unordered_set<std::shared_ptr<Predicate>> c_state;
+    PredicateSet c_state;
     if (PyList_Check(py_list)) {
         for (Py_ssize_t i = 0; i < PyList_Size(py_list); i++) {
             PyObject* item = PyList_GetItem(py_list, i);
@@ -159,7 +162,7 @@ static PyObject* Action_is_applicable(PyAction* self, PyObject* args) {
     if (!PyArg_ParseTuple(args, "O", &py_list)) return NULL;
     if (!self->cpp_obj || !*self->cpp_obj) { PyErr_SetString(PyExc_RuntimeError, "Action uninitialized"); return NULL; }
 
-    std::unordered_set<std::shared_ptr<Predicate>> c_state;
+    PredicateSet c_state;
     if (PyList_Check(py_list)) {
         for (Py_ssize_t i = 0; i < PyList_Size(py_list); i++) {
             PyObject* item = PyList_GetItem(py_list, i);
@@ -179,7 +182,7 @@ static PyObject* Action_apply(PyAction* self, PyObject* args) {
     if (!PyArg_ParseTuple(args, "O", &py_list)) return NULL;
     if (!self->cpp_obj || !*self->cpp_obj) { PyErr_SetString(PyExc_RuntimeError, "Action uninitialized"); return NULL; }
 
-    std::unordered_set<std::shared_ptr<Predicate>> c_state;
+    PredicateSet c_state;
     if (PyList_Check(py_list)) {
         for (Py_ssize_t i = 0; i < PyList_Size(py_list); i++) {
             PyObject* item = PyList_GetItem(py_list, i);
@@ -209,6 +212,57 @@ static PyObject* Action_apply(PyAction* self, PyObject* args) {
     return new_py_list;
 }
 
+static int PyBeliefState_init(PyBeliefState* self, PyObject* args, PyObject* kwds) {
+    self->cpp_obj = new std::shared_ptr<BeliefState>(std::make_shared<BeliefState>());
+    return 0;
+}
+
+static void PyBeliefState_dealloc(PyBeliefState* self) {
+    if (self->cpp_obj) { delete self->cpp_obj; self->cpp_obj = nullptr; }
+    Py_TYPE(self)->tp_free((PyObject*)self);
+}
+
+static PyObject* BeliefState_add_observed(PyBeliefState* self, PyObject* args) {
+    PyObject* py_pred;
+    if (!PyArg_ParseTuple(args, "O", &py_pred)) return NULL;
+    if (!self->cpp_obj || !*self->cpp_obj) { PyErr_SetString(PyExc_RuntimeError, "BeliefState uninitialized"); return NULL; }
+    
+    if (PyObject_TypeCheck(py_pred, &PyPredicateType)) {
+        PyPredicate* p = (PyPredicate*)py_pred;
+        bool added = (*self->cpp_obj)->add_observed(*(p->cpp_obj));
+        return added ? Py_True : Py_False;
+    }
+    PyErr_SetString(PyExc_TypeError, "Expected a Predicate object");
+    return NULL;
+}
+
+static PyObject* BeliefState_get_observed(PyBeliefState* self, PyObject* args) {
+    if (!self->cpp_obj || !*self->cpp_obj) { PyErr_SetString(PyExc_RuntimeError, "BeliefState uninitialized"); return NULL; }
+    
+    const auto& obs = (*self->cpp_obj)->get_observed();
+    PyObject* new_py_list = PyList_New(0);
+    
+    for (const auto& pred : obs) {
+        PyObject* py_str = PyUnicode_FromString(pred->get_name().c_str());
+        PyObject* init_args = PyTuple_Pack(1, py_str);
+        PyObject* py_pred = PyObject_CallObject((PyObject*)&PyPredicateType, init_args);
+        Py_DECREF(init_args);
+        Py_DECREF(py_str);
+
+        if (py_pred) {
+            PyList_Append(new_py_list, py_pred);
+            Py_DECREF(py_pred);
+        }
+    }
+    return new_py_list;
+}
+
+static PyMethodDef BeliefState_methods[] = {
+    {"add_observed", (PyCFunction)BeliefState_add_observed, METH_VARARGS, "Add an observed predicate"},
+    {"get_observed", (PyCFunction)BeliefState_get_observed, METH_NOARGS, "Get list of observed predicates"},
+    {NULL}
+};
+
 static PyMethodDef Action_methods[] = {
     {"set_precondition", (PyCFunction)Action_set_precondition, METH_VARARGS, "Set AST precondition"},
     {"add_effect", (PyCFunction)Action_add_effect, METH_VARARGS, "Add effect (predicate, is_add)"},
@@ -235,10 +289,10 @@ PyMODINIT_FUNC PyInit_cpor_engine(void) {
     PyOrNodeType.tp_name = "cpor_engine.OrNode"; PyOrNodeType.tp_basicsize = sizeof(PyOrNode); PyOrNodeType.tp_dealloc = (destructor)PyOrNode_dealloc; PyOrNodeType.tp_methods = ASTNode_methods; PyOrNodeType.tp_init = (initproc)PyOrNode_init; PyOrNodeType.tp_new = PyType_GenericNew; PyOrNodeType.tp_flags = Py_TPFLAGS_DEFAULT;
     PyNotNodeType.tp_name = "cpor_engine.NotNode"; PyNotNodeType.tp_basicsize = sizeof(PyNotNode); PyNotNodeType.tp_dealloc = (destructor)PyNotNode_dealloc; PyNotNodeType.tp_methods = ASTNode_methods; PyNotNodeType.tp_init = (initproc)PyNotNode_init; PyNotNodeType.tp_new = PyType_GenericNew; PyNotNodeType.tp_flags = Py_TPFLAGS_DEFAULT;
     PyActionType.tp_name = "cpor_engine.Action"; PyActionType.tp_basicsize = sizeof(PyAction); PyActionType.tp_dealloc = (destructor)PyAction_dealloc; PyActionType.tp_methods = Action_methods; PyActionType.tp_init = (initproc)PyAction_init; PyActionType.tp_new = PyType_GenericNew; PyActionType.tp_flags = Py_TPFLAGS_DEFAULT;
-    
+    PyBeliefStateType.tp_name = "cpor_engine.BeliefState"; PyBeliefStateType.tp_basicsize = sizeof(PyBeliefState); PyBeliefStateType.tp_dealloc = (destructor)PyBeliefState_dealloc; PyBeliefStateType.tp_methods = BeliefState_methods; PyBeliefStateType.tp_init = (initproc)PyBeliefState_init; PyBeliefStateType.tp_new = PyType_GenericNew; PyBeliefStateType.tp_flags = Py_TPFLAGS_DEFAULT;
     if (PyType_Ready(&PyPredicateType) < 0 || PyType_Ready(&PyPredicateNodeType) < 0 ||
         PyType_Ready(&PyAndNodeType) < 0 || PyType_Ready(&PyOrNodeType) < 0 || 
-        PyType_Ready(&PyNotNodeType) < 0 || PyType_Ready(&PyActionType) < 0) return NULL;
+        PyType_Ready(&PyNotNodeType) < 0 || PyType_Ready(&PyActionType) < 0 || PyType_Ready(&PyBeliefStateType) < 0) return NULL;
 
     PyObject* m = PyModule_Create(&cpor_engine_module);
     if (!m) return NULL;
@@ -249,6 +303,7 @@ PyMODINIT_FUNC PyInit_cpor_engine(void) {
     Py_INCREF(&PyOrNodeType); PyModule_AddObject(m, "OrNode", (PyObject *)&PyOrNodeType);
     Py_INCREF(&PyNotNodeType); PyModule_AddObject(m, "NotNode", (PyObject *)&PyNotNodeType);
     Py_INCREF(&PyActionType); PyModule_AddObject(m, "Action", (PyObject *)&PyActionType);
+    Py_INCREF(&PyBeliefStateType); PyModule_AddObject(m, "BeliefState", (PyObject *)&PyBeliefStateType);
 
     return m;
 }

@@ -16,11 +16,11 @@ public:
 
     Action(std::string n) : name(n), precondition(nullptr), observe(nullptr) {}
 
-    bool is_applicable(const std::unordered_set<std::shared_ptr<Predicate>>& state) const {
+    bool is_applicable(const PredicateSet& state) const {
         if (!precondition) return true;
         return precondition->is_true(state);
     }
-    void apply(std::unordered_set<std::shared_ptr<Predicate>>& state) const {
+    void apply(PredicateSet& state) const {
         for (const auto& p : del_effects) {
             state.erase(p);
         }

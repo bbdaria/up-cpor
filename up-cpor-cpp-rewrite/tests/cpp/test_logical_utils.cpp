@@ -15,7 +15,7 @@ TEST_CASE("Predicate and PredicateNode Base Evaluations", "[LogicalUtilities]") 
     auto on_b1_b2 = std::make_shared<Predicate>("on", std::vector<std::string>{"b1", "b2"});
 
     // Create a known state map (Only clear(b1) and on(b1,b2) are true)
-    std::unordered_set<std::shared_ptr<Predicate>> state = { clear_b1, on_b1_b2 };
+    PredicateSet state = { clear_b1, on_b1_b2 };
 
     SECTION("Atomic Predicate Leaf Valuation") {
         PredicateNode node_clear_b1(clear_b1);
@@ -52,7 +52,7 @@ TEST_CASE("AndNode Conjunction Logic", "[LogicalUtilities]") {
     auto p1 = std::make_shared<Predicate>("p1");
     auto p2 = std::make_shared<Predicate>("p2");
     
-    std::unordered_set<std::shared_ptr<Predicate>> state = { p1 }; // p1 is true, p2 is false
+    PredicateSet state = { p1 }; // p1 is true, p2 is false
 
     auto node_p1 = std::make_shared<PredicateNode>(p1);
     auto node_p2 = std::make_shared<PredicateNode>(p2);
@@ -92,7 +92,7 @@ TEST_CASE("OrNode Disjunction Logic", "[LogicalUtilities]") {
     auto p1 = std::make_shared<Predicate>("p1");
     auto p2 = std::make_shared<Predicate>("p2");
 
-    std::unordered_set<std::shared_ptr<Predicate>> state = { p1 }; // Only p1 is true
+    PredicateSet state = { p1 }; // Only p1 is true
 
     auto node_p1 = std::make_shared<PredicateNode>(p1);
     auto node_p2 = std::make_shared<PredicateNode>(p2);
@@ -119,7 +119,7 @@ TEST_CASE("OrNode Disjunction Logic", "[LogicalUtilities]") {
 
 TEST_CASE("NotNode Unary Negation Logic", "[LogicalUtilities]") {
     auto p1 = std::make_shared<Predicate>("p1");
-    std::unordered_set<std::shared_ptr<Predicate>> state = { p1 }; // p1 is true
+    PredicateSet state = { p1 }; // p1 is true
 
     auto node_p1 = std::make_shared<PredicateNode>(p1);
     NotNode not_node(node_p1);
@@ -163,7 +163,7 @@ TEST_CASE("De Morgan's Laws Integration", "[LogicalUtilities]") {
         REQUIRE(or_flat->get_operands()[1]->get_type() == Formula::Type::Predicate);
         
         // Verify semantic evaluation match
-        std::unordered_set<std::shared_ptr<Predicate>> state = { p1, p2 }; // Both true
+        PredicateSet state = { p1, p2 }; // Both true
         REQUIRE(and_node->is_true(state) == true);
         REQUIRE(or_flat->is_true(state) == false); // Not(True and True) => False
     }
