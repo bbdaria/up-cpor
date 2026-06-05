@@ -1,132 +1,165 @@
 import cpor_engine
 from collections import deque
-from unified_planning.plans.contingent_plan import ContingentPlanNode
+import subprocess
+import re
+import os
 from unified_planning.shortcuts import Compiler, CompilationKind, get_environment
+from unified_planning.io import PDDLWriter
+
+def extract_and_map_fluents(node, target_set, fnode_map=None):
+    if node.is_fluent_exp():
+        args = [a.object().name if a.is_object_exp() else str(a) for a in node.args]
+        pred_name = node.fluent().name + "_" + "_".join(args) if args else node.fluent().name
+        target_set.add(pred_name)
+        if fnode_map is not None:
+            fnode_map[pred_name] = node
+    elif node.is_and() or node.is_or() or node.is_not():
+        for child in node.args:
+            extract_and_map_fluents(child, target_set, fnode_map)
 
 class DynamicAction:
-    def __init__(self, up_action):
+    def __init__(self, up_action, fnode_map):
         self.name = up_action.name
         self.cpp_action = cpor_engine.Action(self.name)
         self.is_sensing = "sense" in self.name.lower() or "observe" in self.name.lower()
         
-        # 1. Parse Preconditions
         self.preconditions = set()
         for pre in up_action.preconditions:
-            self._extract_fluents(pre, self.preconditions)
+            extract_and_map_fluents(pre, self.preconditions, fnode_map)
             
-        # 2. Dynamically determine the sensing target
         self.observe = None
         if self.is_sensing:
-            target = self.name.split("_")[-1]
-            if "color" in self.name: self.observe = f"is_blue_{target}"
-            elif "clear" in self.name: self.observe = f"clear_{target}"
-            else: self.observe = f"observed_{target}"
+            name_l = self.name.lower()
+            parts = self.name.split("_")
             
-        # 3. Parse Effects and map to C++
+            if "clear" in name_l:
+                self.observe = f"clear_{parts[-1]}"
+            elif "on" in name_l and len(parts) >= 3:
+                self.observe = f"on_{parts[-2]}_{parts[-1]}"
+            elif "color" in name_l:
+                self.observe = f"is_blue_{parts[-1]}"
+            else:
+                self.observe = f"observed_{parts[-1]}"
+            
+            if not self.observe:
+                self.observe = f"observed_{self.name}"
+            
         for effect in up_action.effects:
             fluent_names = set()
-            self._extract_fluents(effect.fluent, fluent_names)
+            extract_and_map_fluents(effect.fluent, fluent_names, fnode_map)
             for pred_name in fluent_names:
                 if effect.value.is_true():
                     self.cpp_action.add_effect(cpor_engine.Predicate(pred_name), True)
                 elif effect.value.is_false():
                     self.cpp_action.add_effect(cpor_engine.Predicate(pred_name), False)
 
-    def _extract_fluents(self, node, target_set):
-        """Recursively unpacks logical blocks to find the actual fluents."""
-        if node.is_fluent_exp():
-            args = [a.object().name if a.is_object_exp() else str(a) for a in node.args]
-            pred_name = node.fluent().name + "_" + "_".join(args) if args else node.fluent().name
-            target_set.add(pred_name)
-        elif node.is_and() or node.is_or():
-            for child in node.args:
-                self._extract_fluents(child, target_set)
-
     def is_applicable(self, state_fact_names):
-        # The action can only execute if the C++ state contains all preconditions
         return self.preconditions.issubset(state_fact_names)
 
     def apply(self, state):
         return self.cpp_action.apply(state)
 
-
 class NativeSDRImpl:
     def __init__(self, problem, error_on_failed_checks=False):
-        # 1. Globally disable UP's strict classical-only safety checks!
         get_environment().error_on_failed_checks = False
-        
         self.problem = problem
-        from unified_planning.engines.sequential_simulator import UPSequentialSimulator
-        self.up_simulator = UPSequentialSimulator(problem, error_on_failed_checks=False)
+        self.fnode_map = {}
+        self.ff_cache = {} # High-Speed Cache to prevent subprocess freezing!
         
-        self.goal_strings = set()
-        for goal in problem.goals:
-            self._extract_fluents(goal, self.goal_strings)
-            
         print("\n[SDR] Dynamically grounding PDDL domain...")
-        # 2. Request the grounder explicitly by name to bypass factory compatibility checks
         with Compiler(name="up_grounder") as grounder:
             self.grounded_problem = grounder.compile(problem).problem
             
+        self.goal_strings = set()
+        for goal in self.grounded_problem.goals:
+            extract_and_map_fluents(goal, self.goal_strings, self.fnode_map)
+            
+        for fnode in self.grounded_problem.initial_values.keys():
+            extract_and_map_fluents(fnode, set(), self.fnode_map)
+            
         print(f"[SDR] Translating {len(self.grounded_problem.actions)} actions to native C++...")
-        self.dynamic_actions = [DynamicAction(a) for a in self.grounded_problem.actions]
+        self.dynamic_actions = {a.name: DynamicAction(a, self.fnode_map) for a in self.grounded_problem.actions}
 
-    def _extract_fluents(self, node, target_set):
-        if node.is_fluent_exp():
-            args = [a.object().name if a.is_object_exp() else str(a) for a in node.args]
-            pred_name = node.fluent().name + "_" + "_".join(args) if args else node.fluent().name
-            target_set.add(pred_name)
-        elif node.is_and() or node.is_or():
-            for child in node.args:
-                self._extract_fluents(child, target_set)
+        self.sensing_map = {}
+        for name, act in self.dynamic_actions.items():
+            if act.is_sensing and act.observe:
+                self.sensing_map[act.observe] = name
 
     def is_goal(self, belief_state):
         state_facts = set(p.get_name() for p in belief_state.get_observed())
         return self.goal_strings.issubset(state_facts)
 
     def get_next_action(self, belief_state):
-        """
-        The Replanner: Uses Python to evaluate preconditions and the 
-        C++ Engine to rapidly generate and hash future states.
-        """
-        initial_state = belief_state.get_observed()
-        initial_names = frozenset(p.get_name() for p in initial_state)
+        current_facts = set(p.get_name() for p in belief_state.get_observed())
+
+        if self.goal_strings.issubset(current_facts):
+            return None
+
+        # Targeted Optimism: Only assume things are true if they are in the sensing map!
+        optimistic_facts = set(current_facts)
+        for hidden_fact in self.sensing_map.keys():
+            if f"NOT_{hidden_fact}" not in current_facts:
+                optimistic_facts.add(hidden_fact)
+
+        # High-Speed Cache Check
+        opt_hash = frozenset(optimistic_facts)
+        if opt_hash in self.ff_cache:
+            first_action_name = self.ff_cache[opt_hash]
+        else:
+            first_action_name = self._run_cpp_ff(optimistic_facts)
+            self.ff_cache[opt_hash] = first_action_name
         
-        # BFS Queue: (current_c++_state_list, set_of_fact_names, path_of_actions)
-        queue = deque([(initial_state, initial_names, [])])
-        visited = set([initial_names])
+        # Explorer Fallback
+        if not first_action_name or first_action_name not in self.dynamic_actions:
+            for name, act in self.dynamic_actions.items():
+                if act.is_sensing and act.observe not in current_facts and f"NOT_{act.observe}" not in current_facts:
+                    if act.is_applicable(current_facts):
+                        return act
+            return None
+
+        dyn_act = self.dynamic_actions[first_action_name]
+
+        # SDR Validation Check
+        missing_preconditions = dyn_act.preconditions - current_facts
+        if not missing_preconditions:
+            return dyn_act 
+
+        for missing in missing_preconditions:
+            if missing in self.sensing_map:
+                sense_act_name = self.sensing_map[missing]
+                return self.dynamic_actions[sense_act_name]
+
+        return dyn_act 
+
+    def _run_cpp_ff(self, optimistic_facts):
+        classical_prob = self.grounded_problem.clone()
+        classical_prob._initial_value.clear()
         
-        fallback_sensing = None
+        classical_prob.clear_actions()
+        for act in self.grounded_problem.actions:
+            if "sense" not in act.name.lower() and "observe" not in act.name.lower():
+                classical_prob.add_action(act)
+        
+        for fact_str in optimistic_facts:
+            if fact_str in self.fnode_map:
+                classical_prob.set_initial_value(self.fnode_map[fact_str], True)
 
-        # Bounded BFS
-        while queue:
-            current_state, current_names, plan = queue.popleft()
-            if len(plan) > 6: continue # Keep search shallow and fast
+        w = PDDLWriter(classical_prob)
+        w.write_domain("temp_d.pddl")
+        w.write_problem("temp_p.pddl")
 
-            for dyn_act in self.dynamic_actions:
-                if dyn_act.is_applicable(current_names):
-                    
-                    if dyn_act.is_sensing and fallback_sensing is None:
-                        if dyn_act.observe not in current_names:
-                            fallback_sensing = dyn_act
+        try:
+            result = subprocess.run(["./ff", "-o", "temp_d.pddl", "-f", "temp_p.pddl"], capture_output=True, text=True)
+            if result.returncode < 0: return None
 
-                    new_state = dyn_act.apply(current_state)
-                    new_names = frozenset(p.get_name() for p in new_state)
-                    
-                    if new_names not in visited:
-                        visited.add(new_names)
-                        new_plan = plan + [dyn_act]
-                        
-                        # Goal Check
-                        if self.goal_strings.issubset(new_names):
-                            return new_plan[0] # Return the first step toward the goal!
-                            
-                        queue.append((new_state, new_names, new_plan))
-                        
-        # If deterministic search fails, we must be missing a fact- trigger sensing
-        if fallback_sensing:
-            return fallback_sensing
-            
+            match = re.search(r'step\s*0:\s*(.*)', result.stdout, re.IGNORECASE)
+            if match:
+                parts = match.group(1).lower().strip().split()
+                act_name = parts[0]
+                if len(parts) > 1: act_name += "_" + "_".join(parts[1:])
+                return act_name
+        except FileNotFoundError:
+            pass 
         return None
 
 class CPORMetaPlanner:
@@ -136,21 +169,16 @@ class CPORMetaPlanner:
 
     def build_plan_graph(self, belief_state):
         bs_hash = tuple(sorted([p.get_name() for p in belief_state.get_observed()]))
-        if bs_hash in self.visited_beliefs:
-            return self.visited_beliefs[bs_hash]
-
-        if self.online_planner.is_goal(belief_state):
-            return {"action": "GOAL REACHED", "children": []}
+        if bs_hash in self.visited_beliefs: return self.visited_beliefs[bs_hash]
+        if self.online_planner.is_goal(belief_state): return {"action": "GOAL REACHED", "children": []}
 
         action = self.online_planner.get_next_action(belief_state)
-        if action is None:
-            return {"action": "DEAD END", "children": []}
+        if action is None: return {"action": "DEAD END", "children": []}
 
         node = {"action": action.name, "children": []}
         self.visited_beliefs[bs_hash] = node
 
         if action.is_sensing:
-            # --- Contingent Branching ---
             bs_true = cpor_engine.BeliefState()
             for p in action.apply(belief_state.get_observed()): bs_true.add_observed(p)
             bs_true.add_observed(cpor_engine.Predicate(action.observe)) 
@@ -159,11 +187,11 @@ class CPORMetaPlanner:
             
             bs_false = cpor_engine.BeliefState()
             for p in action.apply(belief_state.get_observed()): bs_false.add_observed(p)
+            bs_false.add_observed(cpor_engine.Predicate(f"NOT_{action.observe}")) 
             child_f = self.build_plan_graph(bs_false)
             if child_f: node["children"].append((f"Observed: {action.observe} == False", child_f))
             
         else:
-            # --- Deterministic Apply ---
             new_bs = cpor_engine.BeliefState()
             for p in action.apply(belief_state.get_observed()): new_bs.add_observed(p)
             child = self.build_plan_graph(new_bs)
