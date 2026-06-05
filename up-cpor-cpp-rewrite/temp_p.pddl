@@ -4,6 +4,7 @@
  )
  (:init
               (same b1 b1)
+              (on b2 b1)
               (on-table b1)
               (clear b2)
               (same b2 b2)

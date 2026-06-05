@@ -2,7 +2,7 @@
  (:requirements :strips :typing)
  (:types block)
  (:constants
-   b2 b1 - block
+   b1 b2 - block
  )
  (:predicates 
              (clear ?x - block)

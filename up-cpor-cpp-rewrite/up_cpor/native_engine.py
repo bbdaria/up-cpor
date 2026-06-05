@@ -17,10 +17,70 @@ def extract_and_map_fluents(node, target_set, fnode_map=None):
         for child in node.args:
             extract_and_map_fluents(child, target_set, fnode_map)
 
+class MiniSATSolver:
+    def __init__(self, pddl_file="p.pddl"):
+        self.oneof_groups = []
+        self.unknown_facts = set()
+        try:
+            with open(pddl_file, 'r') as f:
+                content = f.read()
+
+            # 1. Parse the Closed World Assumption (The valid unknowns)
+            unknowns = re.findall(r'\(unknown\s*\(([^()]+)\)\)', content)
+            for u in unknowns:
+                self.unknown_facts.add(u.strip().replace(" ", "_"))
+            print(f"[SAT] Loaded {len(self.unknown_facts)} legal unknown variables.")
+
+            # 2. Parse the Physical Axioms (The oneof blocks)
+            parts = content.split("oneof")[1:]
+            for part in parts:
+                depth = 1
+                block_content = ""
+                for char in part:
+                    if char == '(': depth += 1
+                    elif char == ')': depth -= 1
+                    
+                    if depth == 0: break
+                    block_content += char
+                    
+                facts = re.findall(r'\(([^()]+)\)', block_content)
+                group = [f.strip().replace(" ", "_") for f in facts]
+                if group: self.oneof_groups.append(group)
+                
+            print(f"[SAT] Loaded {len(self.oneof_groups)} physical axioms.")
+        except FileNotFoundError:
+            print(f"[SAT] WARNING: {pddl_file} not found. Running without axioms.")
+
+    def propagate(self, current_facts):
+        inferred = set(current_facts)
+        changed = True
+
+        while changed:
+            changed = False
+            for group in self.oneof_groups:
+                true_count = sum(1 for f in group if f in inferred)
+                false_count = sum(1 for f in group if f"NOT_{f}" in inferred)
+
+                if true_count > 1: return None 
+                if false_count == len(group): return None 
+
+                if true_count == 1:
+                    for f in group:
+                        if f not in inferred and f"NOT_{f}" not in inferred:
+                            inferred.add(f"NOT_{f}")
+                            changed = True
+
+                if false_count == len(group) - 1:
+                    for f in group:
+                        if f not in inferred and f"NOT_{f}" not in inferred:
+                            inferred.add(f)
+                            changed = True
+
+        return inferred
+
 class DynamicAction:
     def __init__(self, up_action, fnode_map):
         self.name = up_action.name
-        self.cpp_action = cpor_engine.Action(self.name)
         self.is_sensing = "sense" in self.name.lower() or "observe" in self.name.lower()
         
         self.preconditions = set()
@@ -34,6 +94,8 @@ class DynamicAction:
             
             if "clear" in name_l:
                 self.observe = f"clear_{parts[-1]}"
+            elif "ontable" in name_l or "on-table" in name_l:
+                self.observe = f"on-table_{parts[-1]}"
             elif "on" in name_l and len(parts) >= 3:
                 self.observe = f"on_{parts[-2]}_{parts[-1]}"
             elif "color" in name_l:
@@ -44,27 +106,37 @@ class DynamicAction:
             if not self.observe:
                 self.observe = f"observed_{self.name}"
             
+        self.add_effects = set()
+        self.del_effects = set()
         for effect in up_action.effects:
             fluent_names = set()
             extract_and_map_fluents(effect.fluent, fluent_names, fnode_map)
             for pred_name in fluent_names:
                 if effect.value.is_true():
-                    self.cpp_action.add_effect(cpor_engine.Predicate(pred_name), True)
+                    self.add_effects.add(pred_name)
                 elif effect.value.is_false():
-                    self.cpp_action.add_effect(cpor_engine.Predicate(pred_name), False)
+                    self.del_effects.add(pred_name)
 
     def is_applicable(self, state_fact_names):
         return self.preconditions.issubset(state_fact_names)
 
-    def apply(self, state):
-        return self.cpp_action.apply(state)
+    def apply(self, current_facts_set):
+        new_facts = set(current_facts_set)
+        for f in self.add_effects:
+            new_facts.add(f)
+            new_facts.discard(f"NOT_{f}")
+        for f in self.del_effects:
+            new_facts.discard(f)
+            new_facts.add(f"NOT_{f}")
+        return new_facts
 
 class NativeSDRImpl:
     def __init__(self, problem, error_on_failed_checks=False):
         get_environment().error_on_failed_checks = False
         self.problem = problem
         self.fnode_map = {}
-        self.ff_cache = {} # High-Speed Cache to prevent subprocess freezing!
+        self.ff_cache = {} 
+        self.sat_solver = MiniSATSolver("../tests/blocks2/p.pddl")
         
         print("\n[SDR] Dynamically grounding PDDL domain...")
         with Compiler(name="up_grounder") as grounder:
@@ -77,7 +149,7 @@ class NativeSDRImpl:
         for fnode in self.grounded_problem.initial_values.keys():
             extract_and_map_fluents(fnode, set(), self.fnode_map)
             
-        print(f"[SDR] Translating {len(self.grounded_problem.actions)} actions to native C++...")
+        print(f"[SDR] Translating {len(self.grounded_problem.actions)} actions to native Python/C++...")
         self.dynamic_actions = {a.name: DynamicAction(a, self.fnode_map) for a in self.grounded_problem.actions}
 
         self.sensing_map = {}
@@ -95,13 +167,12 @@ class NativeSDRImpl:
         if self.goal_strings.issubset(current_facts):
             return None
 
-        # Targeted Optimism: Only assume things are true if they are in the sensing map!
+        # STRICT OPTIMISM: Only assume facts are True if PDDL explicitly says they are Unknown!
         optimistic_facts = set(current_facts)
-        for hidden_fact in self.sensing_map.keys():
+        for hidden_fact in self.sat_solver.unknown_facts:
             if f"NOT_{hidden_fact}" not in current_facts:
                 optimistic_facts.add(hidden_fact)
 
-        # High-Speed Cache Check
         opt_hash = frozenset(optimistic_facts)
         if opt_hash in self.ff_cache:
             first_action_name = self.ff_cache[opt_hash]
@@ -109,17 +180,17 @@ class NativeSDRImpl:
             first_action_name = self._run_cpp_ff(optimistic_facts)
             self.ff_cache[opt_hash] = first_action_name
         
-        # Explorer Fallback
+        # STRICT EXPLORATION: Only sense facts if they are explicitly legally unknown!
         if not first_action_name or first_action_name not in self.dynamic_actions:
             for name, act in self.dynamic_actions.items():
-                if act.is_sensing and act.observe not in current_facts and f"NOT_{act.observe}" not in current_facts:
-                    if act.is_applicable(current_facts):
-                        return act
+                if act.is_sensing and act.observe in self.sat_solver.unknown_facts:
+                    if act.observe not in current_facts and f"NOT_{act.observe}" not in current_facts:
+                        if act.is_applicable(current_facts):
+                            return act
             return None
 
         dyn_act = self.dynamic_actions[first_action_name]
 
-        # SDR Validation Check
         missing_preconditions = dyn_act.preconditions - current_facts
         if not missing_preconditions:
             return dyn_act 
@@ -168,7 +239,20 @@ class CPORMetaPlanner:
         self.visited_beliefs = {}
 
     def build_plan_graph(self, belief_state):
-        bs_hash = tuple(sorted([p.get_name() for p in belief_state.get_observed()]))
+        current_facts = set(p.get_name() for p in belief_state.get_observed())
+        
+        inferred_facts = self.online_planner.sat_solver.propagate(current_facts)
+        
+        if inferred_facts is None:
+            return {"action": "DEAD END", "children": []}
+            
+        for f in inferred_facts:
+            if f not in current_facts:
+                belief_state.add_observed(cpor_engine.Predicate(f))
+                current_facts.add(f)
+                
+        bs_hash = tuple(sorted(list(current_facts)))
+        
         if bs_hash in self.visited_beliefs: return self.visited_beliefs[bs_hash]
         if self.online_planner.is_goal(belief_state): return {"action": "GOAL REACHED", "children": []}
 
@@ -179,21 +263,26 @@ class CPORMetaPlanner:
         self.visited_beliefs[bs_hash] = node
 
         if action.is_sensing:
+            new_facts = action.apply(current_facts)
+            
             bs_true = cpor_engine.BeliefState()
-            for p in action.apply(belief_state.get_observed()): bs_true.add_observed(p)
+            for f in new_facts: 
+                if f != f"NOT_{action.observe}": bs_true.add_observed(cpor_engine.Predicate(f))
             bs_true.add_observed(cpor_engine.Predicate(action.observe)) 
             child_t = self.build_plan_graph(bs_true)
             if child_t: node["children"].append((f"Observed: {action.observe} == True", child_t))
             
             bs_false = cpor_engine.BeliefState()
-            for p in action.apply(belief_state.get_observed()): bs_false.add_observed(p)
+            for f in new_facts: 
+                if f != action.observe: bs_false.add_observed(cpor_engine.Predicate(f))
             bs_false.add_observed(cpor_engine.Predicate(f"NOT_{action.observe}")) 
             child_f = self.build_plan_graph(bs_false)
             if child_f: node["children"].append((f"Observed: {action.observe} == False", child_f))
             
         else:
+            new_facts = action.apply(current_facts)
             new_bs = cpor_engine.BeliefState()
-            for p in action.apply(belief_state.get_observed()): new_bs.add_observed(p)
+            for f in new_facts: new_bs.add_observed(cpor_engine.Predicate(f))
             child = self.build_plan_graph(new_bs)
             if child: node["children"].append(("Deterministically", child))
 
