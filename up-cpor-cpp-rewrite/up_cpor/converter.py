@@ -39,9 +39,11 @@ class ASTConverter:
             raise ValueError(f"Unsupported node type in compiler: {up_node}")
 
     def _get_signature(self, up_node: up.model.FNode) -> str:
-        """Helper to convert UP fluent into a single string like 'on_b1_b2'"""
+        """Helper to convert UP fluent into a single string like 'on_b1_b2'.
+        MUST match native_engine.extract_and_map_fluents naming exactly."""
         fluent_name = up_node.fluent().name
-        args = [str(a) for a in up_node.args]
+        args = [a.object().name if a.is_object_exp() else str(a)
+                for a in up_node.args]
         if not args:
             return fluent_name
         return f"{fluent_name}_{'_'.join(args)}"

@@ -5,6 +5,7 @@ import re
 import os
 from unified_planning.shortcuts import Compiler, CompilationKind, get_environment
 from unified_planning.io import PDDLWriter
+from up_cpor.converter import ASTConverter
 
 def extract_and_map_fluents(node, target_set, fnode_map=None):
     if node.is_fluent_exp():
@@ -145,7 +146,15 @@ class NativeSDRImpl:
         self.goal_strings = set()
         for goal in self.grounded_problem.goals:
             extract_and_map_fluents(goal, self.goal_strings, self.fnode_map)
-            
+        
+        self.converter = ASTConverter()
+        compiled_goals = [self.converter.compile_formula(g)
+                          for g in self.grounded_problem.goals]
+        if len(compiled_goals) == 1:
+            self.compiled_goal = compiled_goals[0]
+        else:
+            self.compiled_goal = cpor_engine.AndNode(compiled_goals)
+
         for fnode in self.grounded_problem.initial_values.keys():
             extract_and_map_fluents(fnode, set(), self.fnode_map)
             
@@ -158,8 +167,10 @@ class NativeSDRImpl:
                 self.sensing_map[act.observe] = name
 
     def is_goal(self, belief_state):
-        state_facts = set(p.get_name() for p in belief_state.get_observed())
-        return self.goal_strings.issubset(state_facts)
+        # Evaluate the compiled goal Formula directly in the C++ engine,
+        # over the real observed PredicateSet (no string round-trip).
+        observed = list(belief_state.get_observed())
+        return self.compiled_goal.is_true(observed)
 
     def get_next_action(self, belief_state):
         current_facts = set(p.get_name() for p in belief_state.get_observed())

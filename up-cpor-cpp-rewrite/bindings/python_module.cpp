@@ -43,9 +43,7 @@ static int PyPredicate_init(PyPredicate* self, PyObject* args, PyObject* kwds) {
     return 0; 
 }
 
-static int PyAndNode_init(PyAndNode* self, PyObject* args, PyObject* kwds) { self->cpp_obj = new std::shared_ptr<AndNode>(std::make_shared<AndNode>()); return 0; }
-static int PyOrNode_init(PyOrNode* self, PyObject* args, PyObject* kwds) { self->cpp_obj = new std::shared_ptr<OrNode>(std::make_shared<OrNode>()); return 0; }
-static int PyNotNode_init(PyNotNode* self, PyObject* args, PyObject* kwds) { self->cpp_obj = new std::shared_ptr<NotNode>(std::make_shared<NotNode>()); return 0; }
+
 static int PyAction_init(PyAction* self, PyObject* args, PyObject* kwds) {
     const char* name;
     if (!PyArg_ParseTuple(args, "s", &name)) return -1;
@@ -93,7 +91,8 @@ static PyObject* ASTNode_is_true(PyObject* self, PyObject* args) {
     
     auto formula = extract_formula(self);
     if (!formula) { PyErr_SetString(PyExc_RuntimeError, "C++ Node uninitialized"); return NULL; }
-    return formula->is_true(c_state) ? Py_True : Py_False;
+    if (formula->is_true(c_state)) Py_RETURN_TRUE;
+    else Py_RETURN_FALSE;
 }
 static PyObject* Predicate_get_name(PyPredicate* self, PyObject* args) {
     if (!self->cpp_obj || !*self->cpp_obj) { 
@@ -174,7 +173,8 @@ static PyObject* Action_is_applicable(PyAction* self, PyObject* args) {
     }
     
     bool allowed = (*self->cpp_obj)->is_applicable(c_state);
-    return allowed ? Py_True : Py_False;
+    if (allowed) Py_RETURN_TRUE;
+    else Py_RETURN_FALSE;
 }
 
 static PyObject* Action_apply(PyAction* self, PyObject* args) {
@@ -230,12 +230,67 @@ static PyObject* BeliefState_add_observed(PyBeliefState* self, PyObject* args) {
     if (PyObject_TypeCheck(py_pred, &PyPredicateType)) {
         PyPredicate* p = (PyPredicate*)py_pred;
         bool added = (*self->cpp_obj)->add_observed(*(p->cpp_obj));
-        return added ? Py_True : Py_False;
+        if (added) Py_RETURN_TRUE;
+        else Py_RETURN_FALSE;
     }
     PyErr_SetString(PyExc_TypeError, "Expected a Predicate object");
     return NULL;
 }
+static int PyPredicateNode_init(PyPredicateNode* self, PyObject* args, PyObject* kwds) {
+    PyObject* py_pred;
+    if (!PyArg_ParseTuple(args, "O", &py_pred)) return -1;
+    if (!PyObject_TypeCheck(py_pred, &PyPredicateType)) {
+        PyErr_SetString(PyExc_TypeError, "PredicateNode requires a Predicate");
+        return -1;
+    }
+    PyPredicate* p = (PyPredicate*)py_pred;
+    if (!p->cpp_obj || !*p->cpp_obj) {
+        PyErr_SetString(PyExc_RuntimeError, "Predicate uninitialized");
+        return -1;
+    }
+    self->cpp_obj = new std::shared_ptr<PredicateNode>(
+        std::make_shared<PredicateNode>(*(p->cpp_obj)));
+    return 0;
+}
+static int PyOrNode_init(PyOrNode* self, PyObject* args, PyObject* kwds) {
+    PyObject* py_list = nullptr;
+    if (!PyArg_ParseTuple(args, "|O", &py_list)) return -1;  // optional arg
 
+    FormulaList children;
+    if (py_list && PyList_Check(py_list)) {
+        for (Py_ssize_t i = 0; i < PyList_Size(py_list); i++) {
+            PyObject* item = PyList_GetItem(py_list, i);
+            auto f = extract_formula(item);
+            if (f) children.push_back(f);
+        }
+    }
+    self->cpp_obj = new std::shared_ptr<OrNode>(std::make_shared<OrNode>(children));
+    return 0;
+}
+
+static int PyNotNode_init(PyNotNode* self, PyObject* args, PyObject* kwds) {
+    PyObject* py_child = nullptr;
+    if (!PyArg_ParseTuple(args, "|O", &py_child)) return -1;
+    std::shared_ptr<Formula> child = py_child ? extract_formula(py_child) : nullptr;
+    self->cpp_obj = new std::shared_ptr<NotNode>(std::make_shared<NotNode>(child));
+    return 0;
+}
+
+static int PyAndNode_init(PyAndNode* self, PyObject* args, PyObject* kwds) {
+    PyObject* py_list = nullptr;
+    if (!PyArg_ParseTuple(args, "|O", &py_list)) return -1;  // optional arg
+
+    FormulaList children;
+    if (py_list && PyList_Check(py_list)) {
+        for (Py_ssize_t i = 0; i < PyList_Size(py_list); i++) {
+            PyObject* item = PyList_GetItem(py_list, i);
+            auto f = extract_formula(item);
+            if (f) children.push_back(f);
+        }
+    }
+    self->cpp_obj = new std::shared_ptr<AndNode>(std::make_shared<AndNode>(children));
+    return 0;
+}
 static PyObject* BeliefState_get_observed(PyBeliefState* self, PyObject* args) {
     if (!self->cpp_obj || !*self->cpp_obj) { PyErr_SetString(PyExc_RuntimeError, "BeliefState uninitialized"); return NULL; }
     
@@ -284,7 +339,7 @@ static void PyAction_dealloc(PyAction* self) { if (self->cpp_obj) { delete self-
 PyMODINIT_FUNC PyInit_cpor_engine(void) {
     // BUG FIX: Added Py_TPFLAGS_DEFAULT to everything to fix Python 3 init bug
     PyPredicateType.tp_name = "cpor_engine.Predicate"; PyPredicateType.tp_basicsize = sizeof(PyPredicate); PyPredicateType.tp_dealloc = (destructor)PyPredicate_dealloc; PyPredicateType.tp_init = (initproc)PyPredicate_init; PyPredicateType.tp_new = PyType_GenericNew; PyPredicateType.tp_flags = Py_TPFLAGS_DEFAULT; PyPredicateType.tp_methods = Predicate_methods;
-    PyPredicateNodeType.tp_name = "cpor_engine.PredicateNode"; PyPredicateNodeType.tp_basicsize = sizeof(PyPredicateNode); PyPredicateNodeType.tp_dealloc = (destructor)PyPredicateNode_dealloc; PyPredicateNodeType.tp_methods = ASTNode_methods; PyPredicateNodeType.tp_new = PyType_GenericNew; PyPredicateNodeType.tp_flags = Py_TPFLAGS_DEFAULT;
+    PyPredicateNodeType.tp_name = "cpor_engine.PredicateNode"; PyPredicateNodeType.tp_basicsize = sizeof(PyPredicateNode); PyPredicateNodeType.tp_dealloc = (destructor)PyPredicateNode_dealloc; PyPredicateNodeType.tp_methods = ASTNode_methods; PyPredicateNodeType.tp_new = PyType_GenericNew; PyPredicateNodeType.tp_flags = Py_TPFLAGS_DEFAULT; PyPredicateNodeType.tp_init = (initproc)PyPredicateNode_init;
     PyAndNodeType.tp_name = "cpor_engine.AndNode"; PyAndNodeType.tp_basicsize = sizeof(PyAndNode); PyAndNodeType.tp_dealloc = (destructor)PyAndNode_dealloc; PyAndNodeType.tp_methods = ASTNode_methods; PyAndNodeType.tp_init = (initproc)PyAndNode_init; PyAndNodeType.tp_new = PyType_GenericNew; PyAndNodeType.tp_flags = Py_TPFLAGS_DEFAULT;
     PyOrNodeType.tp_name = "cpor_engine.OrNode"; PyOrNodeType.tp_basicsize = sizeof(PyOrNode); PyOrNodeType.tp_dealloc = (destructor)PyOrNode_dealloc; PyOrNodeType.tp_methods = ASTNode_methods; PyOrNodeType.tp_init = (initproc)PyOrNode_init; PyOrNodeType.tp_new = PyType_GenericNew; PyOrNodeType.tp_flags = Py_TPFLAGS_DEFAULT;
     PyNotNodeType.tp_name = "cpor_engine.NotNode"; PyNotNodeType.tp_basicsize = sizeof(PyNotNode); PyNotNodeType.tp_dealloc = (destructor)PyNotNode_dealloc; PyNotNodeType.tp_methods = ASTNode_methods; PyNotNodeType.tp_init = (initproc)PyNotNode_init; PyNotNodeType.tp_new = PyType_GenericNew; PyNotNodeType.tp_flags = Py_TPFLAGS_DEFAULT;
