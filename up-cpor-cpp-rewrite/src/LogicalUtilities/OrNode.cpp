@@ -141,14 +141,22 @@ bool OrNode::contains_non_deterministic_effect() const { return false; }
 int OrNode::get_max_non_deterministic_options() const { return 1; }
 void OrNode::get_all_optional_predicates(PredicateSet& predicates) const {}
 std::shared_ptr<Formula> OrNode::create_regression(std::shared_ptr<Predicate> pred, int choice) { return clone(); }
-std::shared_ptr<Formula> OrNode::generate_given(const std::string& tag, const std::vector<std::string>& always_known) { return clone(); }
+std::shared_ptr<Formula> OrNode::generate_given(const std::string& tag, const std::vector<std::string>& always_known) {
+    FormulaList out;
+    for (const auto& f : operands_) out.push_back(f->generate_given(tag, always_known));
+    return std::make_shared<OrNode>(out);
+}
 std::shared_ptr<Formula> OrNode::add_time(int time) { return clone(); }
 std::shared_ptr<Formula> OrNode::replace_negative_effects_in_condition() { return clone(); }
 std::shared_ptr<Formula> OrNode::remove_impossible_options(const PredicateSet& observed) { return clone(); }
 std::shared_ptr<Formula> OrNode::apply_known(const PredicateSet& known) { return reduce(known); }
 std::vector<std::shared_ptr<Predicate>> OrNode::get_non_deterministic_effects() { return {}; }
 std::shared_ptr<Formula> OrNode::remove_universal_quantifiers(const std::vector<std::shared_ptr<Constant>>& constants, const std::vector<std::shared_ptr<Predicate>>& constant_predicates, std::shared_ptr<Domain> d) { return clone(); }
-std::shared_ptr<Formula> OrNode::get_knowledge_formula(const std::vector<std::string>& always_known, bool know_whether) { return clone(); }
+std::shared_ptr<Formula> OrNode::get_knowledge_formula(const std::vector<std::string>& always_known, bool know_whether) {
+    FormulaList out;
+    for (const auto& f : operands_) out.push_back(f->get_knowledge_formula(always_known, know_whether));
+    return std::make_shared<OrNode>(out);
+}
 std::shared_ptr<Formula> OrNode::reduce_conditions(const PredicateSet& known) { return reduce(known); }
 std::shared_ptr<Formula> OrNode::remove_negations() {
     FormulaList clean_ops;

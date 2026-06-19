@@ -88,14 +88,20 @@ public:
     virtual int get_max_non_deterministic_options() const override { return 1; }
     virtual void get_all_optional_predicates(PredicateSet& p) const override {}
     virtual std::shared_ptr<Formula> create_regression(std::shared_ptr<Predicate> p, int c) override { return clone(); }
-    virtual std::shared_ptr<Formula> generate_given(const std::string& t, const std::vector<std::string>& a) override { return clone(); }
+    virtual std::shared_ptr<Formula> generate_given(const std::string& t, const std::vector<std::string>& a) override {
+        return child_ ? std::make_shared<NotNode>(child_->generate_given(t, a)) : clone();
+    }
     virtual std::shared_ptr<Formula> add_time(int t) override { return clone(); }
     virtual std::shared_ptr<Formula> replace_negative_effects_in_condition() override { return clone(); }
     virtual std::shared_ptr<Formula> remove_impossible_options(const PredicateSet& o) override { return clone(); }
     virtual std::shared_ptr<Formula> apply_known(const PredicateSet& k) override { return reduce(k); }
     virtual std::vector<std::shared_ptr<Predicate>> get_non_deterministic_effects() override { return {}; }
     virtual std::shared_ptr<Formula> remove_universal_quantifiers(const std::vector<std::shared_ptr<Constant>>& c, const std::vector<std::shared_ptr<Predicate>>& cp, std::shared_ptr<Domain> d) override { return clone(); }
-    virtual std::shared_ptr<Formula> get_knowledge_formula(const std::vector<std::string>& a, bool kw) override { return clone(); }
+    virtual std::shared_ptr<Formula> get_knowledge_formula(const std::vector<std::string>& a, bool kw) override {
+        // Push negation inward so the K/KW predicate is formed on the (negated)
+        // atom: K(¬p) -> KN p, KW(¬p) -> KW p (knowing-whether is sign-agnostic).
+        return child_ ? child_->negate()->get_knowledge_formula(a, kw) : clone();
+    }
     virtual std::shared_ptr<Formula> reduce_conditions(const PredicateSet& k) override { return reduce(k); }
     virtual std::shared_ptr<Formula> remove_negations() override { return nullptr; }
 };

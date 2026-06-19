@@ -429,6 +429,12 @@ int gnum_in_plan_E;
 int gplan_ops[MAX_PLAN_LENGTH];
 int gnum_plan_ops = 0;
 
+/* When >= 0, print_plan() writes the plan (one "OP arg arg" per line) to this
+ * file descriptor instead of stdout. Set by the in-process fork() wrapper so the
+ * parent can read the plan back as structured data. -1 disables capture.
+ */
+int gplan_capture_fd = -1;
+
 
 
 /* stores the states that the current plan goes through
@@ -483,7 +489,10 @@ struct tms lstart, lend;
 
 
 
-int main( int argc, char *argv[] )
+/* Renamed from main() so Metric-FF can be linked into the cpor engine as a
+ * library and invoked (under fork()) by the in-process wrapper in ff_wrapper.cpp.
+ */
+int ff_main( int argc, char *argv[] )
 
 {
 

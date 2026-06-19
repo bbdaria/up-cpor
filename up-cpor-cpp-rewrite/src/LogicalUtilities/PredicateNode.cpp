@@ -147,7 +147,10 @@ std::shared_ptr<Formula> PredicateNode::generate_given(const std::string& tag, c
 }
 
 std::shared_ptr<Formula> PredicateNode::add_time(int time) {
-    throw std::runtime_error("add_time not implemented for PredicateNode");
+    // Time-tag the predicate so the same fluent can be referred to at distinct
+    // planning steps (e.g. when unrolling a formula across a horizon). This
+    // mirrors generate_given(), which appends a tag to the predicate name.
+    return std::make_shared<PredicateNode>(predicate_->generate_given(std::to_string(time)));
 }
 
 std::shared_ptr<Formula> PredicateNode::replace_negative_effects_in_condition() {

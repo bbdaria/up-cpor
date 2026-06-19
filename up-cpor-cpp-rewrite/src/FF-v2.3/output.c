@@ -58,6 +58,8 @@
 
 #include "output.h"
 
+#include <unistd.h>  /* write() for in-process plan capture */
+
 
 
 
@@ -754,11 +756,45 @@ void print_op_name( int index )
 
 
 
+extern int gplan_capture_fd;
+
+/* Write one operator (its name plus instantiated arg constants) to a buffer,
+ * space-separated, e.g. "MOVE-B-TO-B B2 B3 B1". Returns chars written. */
+static int format_op_name( int index, char *buf, int buflen )
+{
+  int i, n = 0;
+  Action *a = gop_conn[index].action;
+
+  if ( !a->norm_operator && !a->pseudo_action ) {
+    n += snprintf( buf + n, buflen - n, "REACH-GOAL" );
+  } else {
+    n += snprintf( buf + n, buflen - n, "%s", a->name );
+    for ( i = 0; i < a->num_name_vars; i++ ) {
+      n += snprintf( buf + n, buflen - n, " %s", gconstants[a->name_inst_table[i]] );
+    }
+  }
+  return n;
+}
+
 void print_plan( void )
 
-{  
+{
 
   int i; /*, ef, j;*/
+
+  /* In-process capture mode: emit the plan as structured lines to the wrapper's
+   * pipe instead of human-readable stdout. One "OP arg arg" per line. */
+  if ( gplan_capture_fd >= 0 ) {
+    char line[MAX_LENGTH * 4];
+    for ( i = 0; i < gnum_plan_ops; i++ ) {
+      int n = format_op_name( gplan_ops[i], line, sizeof(line) - 1 );
+      line[n++] = '\n';
+      if ( write( gplan_capture_fd, line, n ) != n ) {
+        /* best-effort: nothing useful to do on a short write in the child */
+      }
+    }
+    return;
+  }
 
   printf("\n\nff: found legal plan as follows");
   printf("\n\nstep ");

@@ -208,8 +208,10 @@
 
 
 
-#define MAX_CONSTANTS 2000
-#define MAX_PREDICATES 500
+/* MAX_PREDICATES raised: the KT translation emits one 0-ary predicate per
+ * (un)grounded fluent and per tag, which is large on doors15 and wumpus. */
+#define MAX_CONSTANTS 5000
+#define MAX_PREDICATES 20000
 #define MAX_TYPES 50
 #define MAX_ARITY 5
 #define MAX_VARS 15
@@ -218,7 +220,8 @@
 #define MAX_TYPE 2000
 
 
-#define MAX_OPERATORS 1000
+/* MAX_OPERATORS raised for large grounded domains (e.g. doors15). */
+#define MAX_OPERATORS 20000
 
 
 /* in DNF: AND with OR - sons - collect 'hitting set':

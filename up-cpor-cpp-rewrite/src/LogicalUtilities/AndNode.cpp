@@ -156,14 +156,23 @@ bool AndNode::contains_non_deterministic_effect() const { return false; }
 int AndNode::get_max_non_deterministic_options() const { return 1; }
 void AndNode::get_all_optional_predicates(PredicateSet& predicates) const {}
 std::shared_ptr<Formula> AndNode::create_regression(std::shared_ptr<Predicate> pred, int choice) { return clone(); }
-std::shared_ptr<Formula> AndNode::generate_given(const std::string& tag, const std::vector<std::string>& always_known) { return clone(); }
+std::shared_ptr<Formula> AndNode::generate_given(const std::string& tag, const std::vector<std::string>& always_known) {
+    FormulaList out;
+    for (const auto& f : operands_) out.push_back(f->generate_given(tag, always_known));
+    return std::make_shared<AndNode>(out);
+}
 std::shared_ptr<Formula> AndNode::add_time(int time) { return clone(); }
 std::shared_ptr<Formula> AndNode::replace_negative_effects_in_condition() { return clone(); }
 std::shared_ptr<Formula> AndNode::remove_impossible_options(const PredicateSet& observed) { return clone(); }
 std::shared_ptr<Formula> AndNode::apply_known(const PredicateSet& known) { return reduce(known); }
 std::vector<std::shared_ptr<Predicate>> AndNode::get_non_deterministic_effects() { return {}; }
 std::shared_ptr<Formula> AndNode::remove_universal_quantifiers(const std::vector<std::shared_ptr<Constant>>& constants, const std::vector<std::shared_ptr<Predicate>>& constant_predicates, std::shared_ptr<Domain> d) { return clone(); }
-std::shared_ptr<Formula> AndNode::get_knowledge_formula(const std::vector<std::string>& always_known, bool know_whether) { return clone(); }
+std::shared_ptr<Formula> AndNode::get_knowledge_formula(const std::vector<std::string>& always_known, bool know_whether) {
+    // K(a ∧ b) = K(a) ∧ K(b); KW likewise recurses per operand (mirrors C# CompoundFormula).
+    FormulaList out;
+    for (const auto& f : operands_) out.push_back(f->get_knowledge_formula(always_known, know_whether));
+    return std::make_shared<AndNode>(out);
+}
 std::shared_ptr<Formula> AndNode::reduce_conditions(const PredicateSet& known) { return reduce(known); }
 std::shared_ptr<Formula> AndNode::remove_negations() {
     FormulaList clean_ops;

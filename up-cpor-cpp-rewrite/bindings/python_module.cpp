@@ -10,12 +10,105 @@
 #include "LogicalUtilities/AndNode.h"
 #include "LogicalUtilities/OrNode.h"
 #include "LogicalUtilities/NotNode.h"
-#include "PlanningModel/Action.h" 
-#include "PlanningModel/BeliefState.h"
+#include "PlanningModel/BeliefSolver.h"
+#include "PlanningModel/KTTranslator.h"
+#include "FF-v2.3/ff_wrapper.h"
+
+static bool py_list_to_strings(PyObject* py_list, std::vector<std::string>& out);  // fwd decl
+
+// 0. Module-level functions
+// ff_solve(domain_path, problem_path) -> list[str]
+// Runs the in-process Metric-FF classical planner and returns the plan as a list
+// of operator strings ("OP arg arg", FF's upper-case names).
+static PyObject* py_ff_solve(PyObject* self, PyObject* args) {
+    const char* domain_path;
+    const char* problem_path;
+    if (!PyArg_ParseTuple(args, "ss", &domain_path, &problem_path)) return NULL;
+
+    std::vector<std::string> plan;
+    Py_BEGIN_ALLOW_THREADS
+    plan = ff_solve(std::string(domain_path), std::string(problem_path));
+    Py_END_ALLOW_THREADS
+
+    PyObject* py_list = PyList_New(0);
+    if (!py_list) return NULL;
+    for (const auto& step : plan) {
+        PyObject* s = PyUnicode_FromString(step.c_str());
+        if (!s) { Py_DECREF(py_list); return NULL; }
+        PyList_Append(py_list, s);
+        Py_DECREF(s);
+    }
+    return py_list;
+}
+
+// Parse a Python list of (str, bool) tuples.
+static bool parse_literal_list(PyObject* py_list, std::vector<std::pair<std::string, bool>>& out) {
+    if (!PyList_Check(py_list)) { PyErr_SetString(PyExc_TypeError, "expected a list"); return false; }
+    for (Py_ssize_t i = 0; i < PyList_Size(py_list); i++) {
+        PyObject* item = PyList_GetItem(py_list, i);
+        const char* name; int pol;
+        if (!PyArg_ParseTuple(item, "sp", &name, &pol)) return false;
+        out.emplace_back(std::string(name), pol != 0);
+    }
+    return true;
+}
+
+// kt_translate(actions, uncertain, tags, known_true, goal) -> (domain_str, problem_str)
+//   actions: list of (name, is_sensing, observe_or_None, pre[(f,pol)], add[str], del[str])
+//   uncertain: list[str]; tags: list[list[str]]; known_true: list[str]; goal: list[(f,pol)]
+static PyObject* py_kt_translate(PyObject* self, PyObject* args) {
+    PyObject *py_actions, *py_uncertain, *py_tags, *py_known, *py_goal;
+    if (!PyArg_ParseTuple(args, "OOOOO", &py_actions, &py_uncertain, &py_tags, &py_known, &py_goal))
+        return NULL;
+
+    std::vector<KTAction> actions;
+    if (!PyList_Check(py_actions)) { PyErr_SetString(PyExc_TypeError, "actions must be a list"); return NULL; }
+    for (Py_ssize_t i = 0; i < PyList_Size(py_actions); i++) {
+        PyObject *name, *is_sensing, *observe, *pre, *add, *del;
+        if (!PyArg_ParseTuple(PyList_GetItem(py_actions, i), "OOOOOO",
+                              &name, &is_sensing, &observe, &pre, &add, &del))
+            return NULL;
+        KTAction a;
+        a.name = PyUnicode_AsUTF8(name);
+        a.is_sensing = PyObject_IsTrue(is_sensing) == 1;
+        a.observe = (observe == Py_None) ? "" : PyUnicode_AsUTF8(observe);
+        if (!parse_literal_list(pre, a.pre)) return NULL;
+        if (!py_list_to_strings(add, a.add)) return NULL;
+        if (!py_list_to_strings(del, a.del)) return NULL;
+        actions.push_back(std::move(a));
+    }
+
+    std::vector<std::string> uncertain, known_true;
+    if (!py_list_to_strings(py_uncertain, uncertain)) return NULL;
+    if (!py_list_to_strings(py_known, known_true)) return NULL;
+
+    std::vector<std::vector<std::string>> tags;
+    if (!PyList_Check(py_tags)) { PyErr_SetString(PyExc_TypeError, "tags must be a list"); return NULL; }
+    for (Py_ssize_t i = 0; i < PyList_Size(py_tags); i++) {
+        std::vector<std::string> t;
+        if (!py_list_to_strings(PyList_GetItem(py_tags, i), t)) return NULL;
+        tags.push_back(std::move(t));
+    }
+
+    std::vector<std::pair<std::string, bool>> goal;
+    if (!parse_literal_list(py_goal, goal)) return NULL;
+
+    auto result = kt_translate(actions, uncertain, tags, known_true, goal);
+    return Py_BuildValue("ss", result.first.c_str(), result.second.c_str());
+}
+
+static PyMethodDef cpor_engine_functions[] = {
+    {"ff_solve", (PyCFunction)py_ff_solve, METH_VARARGS,
+     "ff_solve(domain_path, problem_path) -> list[str]: run Metric-FF, return the plan."},
+    {"kt_translate", (PyCFunction)py_kt_translate, METH_VARARGS,
+     "kt_translate(actions, uncertain, tags, known_true, goal) -> (domain, problem): KT translation."},
+    {NULL, NULL, 0, NULL}
+};
 
 // 1. Module Definition
 static struct PyModuleDef cpor_engine_module = {
-    PyModuleDef_HEAD_INIT, "cpor_engine", "CPOR C++ Logical Extension Module", -1, NULL
+    PyModuleDef_HEAD_INIT, "cpor_engine", "CPOR C++ Logical Extension Module", -1,
+    cpor_engine_functions
 };
 
 // 2. Global Type Definitions
@@ -24,30 +117,20 @@ static PyTypeObject PyPredicateNodeType = { PyVarObject_HEAD_INIT(NULL, 0) };
 static PyTypeObject PyAndNodeType = { PyVarObject_HEAD_INIT(NULL, 0) };
 static PyTypeObject PyOrNodeType = { PyVarObject_HEAD_INIT(NULL, 0) };
 static PyTypeObject PyNotNodeType = { PyVarObject_HEAD_INIT(NULL, 0) };
-static PyTypeObject PyActionType = { PyVarObject_HEAD_INIT(NULL, 0) };
-static PyTypeObject PyBeliefStateType = { PyVarObject_HEAD_INIT(NULL, 0) };
+static PyTypeObject PyBeliefSolverType = { PyVarObject_HEAD_INIT(NULL, 0) };
 
 typedef struct { PyObject_HEAD std::shared_ptr<Predicate>* cpp_obj; } PyPredicate;
 typedef struct { PyObject_HEAD std::shared_ptr<PredicateNode>* cpp_obj; } PyPredicateNode;
 typedef struct { PyObject_HEAD std::shared_ptr<AndNode>* cpp_obj; } PyAndNode;
 typedef struct { PyObject_HEAD std::shared_ptr<OrNode>* cpp_obj; } PyOrNode;
 typedef struct { PyObject_HEAD std::shared_ptr<NotNode>* cpp_obj; } PyNotNode;
-typedef struct { PyObject_HEAD std::shared_ptr<Action>* cpp_obj; } PyAction;
-typedef struct { PyObject_HEAD std::shared_ptr<BeliefState>* cpp_obj; } PyBeliefState;
+typedef struct { PyObject_HEAD std::shared_ptr<BeliefSolver>* cpp_obj; } PyBeliefSolver;
 
 // 3. Init Functions (Allocation)
-static int PyPredicate_init(PyPredicate* self, PyObject* args, PyObject* kwds) { 
-    const char* name; 
-    if (!PyArg_ParseTuple(args, "s", &name)) return -1; 
-    self->cpp_obj = new std::shared_ptr<Predicate>(std::make_shared<Predicate>(std::string(name))); 
-    return 0; 
-}
-
-
-static int PyAction_init(PyAction* self, PyObject* args, PyObject* kwds) {
+static int PyPredicate_init(PyPredicate* self, PyObject* args, PyObject* kwds) {
     const char* name;
     if (!PyArg_ParseTuple(args, "s", &name)) return -1;
-    self->cpp_obj = new std::shared_ptr<Action>(std::make_shared<Action>(std::string(name)));
+    self->cpp_obj = new std::shared_ptr<Predicate>(std::make_shared<Predicate>(std::string(name)));
     return 0;
 }
 
@@ -110,132 +193,6 @@ static PyMethodDef Predicate_methods[] = {
 
 static PyMethodDef ASTNode_methods[] = {{"is_true", (PyCFunction)ASTNode_is_true, METH_VARARGS, NULL}, {NULL}};
 
-// 6. Action Methods (Now protected against Segfaults)
-static PyObject* Action_set_precondition(PyAction* self, PyObject* args) {
-    PyObject* py_formula;
-    if (!PyArg_ParseTuple(args, "O", &py_formula)) return NULL;
-    if (!self->cpp_obj || !*self->cpp_obj) { PyErr_SetString(PyExc_RuntimeError, "Action uninitialized"); return NULL; }
-    
-    auto formula = extract_formula(py_formula);
-    (*self->cpp_obj)->precondition = formula;
-    Py_RETURN_NONE;
-}
-
-static PyObject* Action_add_effect(PyAction* self, PyObject* args) {
-    PyObject* py_pred; int is_add;
-    if (!PyArg_ParseTuple(args, "Op", &py_pred, &is_add)) return NULL;
-    
-    if (!self->cpp_obj || !*self->cpp_obj) { PyErr_SetString(PyExc_RuntimeError, "Action uninitialized"); return NULL; }
-
-    if (PyObject_TypeCheck(py_pred, &PyPredicateType)) {
-        PyPredicate* p = (PyPredicate*)py_pred;
-        if (!p->cpp_obj || !*p->cpp_obj) {
-            PyErr_SetString(PyExc_RuntimeError, "Predicate uninitialized"); return NULL;
-        }
-        auto pred = *(p->cpp_obj);
-        if (is_add) (*self->cpp_obj)->add_effects.push_back(pred);
-        else (*self->cpp_obj)->del_effects.push_back(pred);
-    } else {
-        PyErr_SetString(PyExc_TypeError, "Expected a Predicate object");
-        return NULL;
-    }
-    Py_RETURN_NONE;
-}
-
-static PyObject* Action_set_observe(PyAction* self, PyObject* args) {
-    PyObject* py_pred;
-    if (!PyArg_ParseTuple(args, "O", &py_pred)) return NULL;
-    if (!self->cpp_obj || !*self->cpp_obj) { PyErr_SetString(PyExc_RuntimeError, "Action uninitialized"); return NULL; }
-
-    if (PyObject_TypeCheck(py_pred, &PyPredicateType)) {
-        PyPredicate* p = (PyPredicate*)py_pred;
-        if (p->cpp_obj && *p->cpp_obj) {
-            (*self->cpp_obj)->observe = *(p->cpp_obj);
-        }
-    }
-    Py_RETURN_NONE;
-}
-
-static PyObject* Action_is_applicable(PyAction* self, PyObject* args) {
-    PyObject* py_list;
-    if (!PyArg_ParseTuple(args, "O", &py_list)) return NULL;
-    if (!self->cpp_obj || !*self->cpp_obj) { PyErr_SetString(PyExc_RuntimeError, "Action uninitialized"); return NULL; }
-
-    PredicateSet c_state;
-    if (PyList_Check(py_list)) {
-        for (Py_ssize_t i = 0; i < PyList_Size(py_list); i++) {
-            PyObject* item = PyList_GetItem(py_list, i);
-            if (PyObject_TypeCheck(item, &PyPredicateType)) {
-                PyPredicate* p = (PyPredicate*)item;
-                if (p->cpp_obj && *p->cpp_obj) c_state.insert(*(p->cpp_obj));
-            }
-        }
-    }
-    
-    bool allowed = (*self->cpp_obj)->is_applicable(c_state);
-    if (allowed) Py_RETURN_TRUE;
-    else Py_RETURN_FALSE;
-}
-
-static PyObject* Action_apply(PyAction* self, PyObject* args) {
-    PyObject* py_list;
-    if (!PyArg_ParseTuple(args, "O", &py_list)) return NULL;
-    if (!self->cpp_obj || !*self->cpp_obj) { PyErr_SetString(PyExc_RuntimeError, "Action uninitialized"); return NULL; }
-
-    PredicateSet c_state;
-    if (PyList_Check(py_list)) {
-        for (Py_ssize_t i = 0; i < PyList_Size(py_list); i++) {
-            PyObject* item = PyList_GetItem(py_list, i);
-            if (PyObject_TypeCheck(item, &PyPredicateType)) {
-                PyPredicate* p = (PyPredicate*)item;
-                if (p->cpp_obj && *p->cpp_obj) c_state.insert(*(p->cpp_obj));
-            }
-        }
-    }
-    
-    (*self->cpp_obj)->apply(c_state);
-    
-    PyObject* new_py_list = PyList_New(0);
-    for (const auto& pred : c_state) {
-        PyObject* py_str = PyUnicode_FromString(pred->get_name().c_str());
-        PyObject* init_args = PyTuple_Pack(1, py_str);
-        PyObject* py_pred = PyObject_CallObject((PyObject*)&PyPredicateType, init_args);
-        Py_DECREF(init_args);
-        Py_DECREF(py_str);
-
-        if (py_pred) {
-            PyList_Append(new_py_list, py_pred);
-            Py_DECREF(py_pred);
-        }
-    }
-    
-    return new_py_list;
-}
-
-static int PyBeliefState_init(PyBeliefState* self, PyObject* args, PyObject* kwds) {
-    self->cpp_obj = new std::shared_ptr<BeliefState>(std::make_shared<BeliefState>());
-    return 0;
-}
-
-static void PyBeliefState_dealloc(PyBeliefState* self) {
-    if (self->cpp_obj) { delete self->cpp_obj; self->cpp_obj = nullptr; }
-    Py_TYPE(self)->tp_free((PyObject*)self);
-}
-
-static PyObject* BeliefState_add_observed(PyBeliefState* self, PyObject* args) {
-    PyObject* py_pred;
-    if (!PyArg_ParseTuple(args, "O", &py_pred)) return NULL;
-    if (!self->cpp_obj || !*self->cpp_obj) { PyErr_SetString(PyExc_RuntimeError, "BeliefState uninitialized"); return NULL; }
-    
-    if (PyObject_TypeCheck(py_pred, &PyPredicateType)) {
-        PyPredicate* p = (PyPredicate*)py_pred;
-        bool added = (*self->cpp_obj)->add_observed(*(p->cpp_obj));
-        if (added) Py_RETURN_TRUE;
-        else Py_RETURN_FALSE;
-    }
-    PyErr_SetString(PyExc_TypeError, "Expected a Predicate object");
-    return NULL;
-}
 static int PyPredicateNode_init(PyPredicateNode* self, PyObject* args, PyObject* kwds) {
     PyObject* py_pred;
     if (!PyArg_ParseTuple(args, "O", &py_pred)) return -1;
@@ -327,6 +284,120 @@ static PyMethodDef Action_methods[] = {
     {NULL}
 };
 
+// 6b. BeliefSolver (Z3-backed reasoning over initial-state constraints)
+static bool py_list_to_strings(PyObject* py_list, std::vector<std::string>& out) {
+    if (!PyList_Check(py_list)) {
+        PyErr_SetString(PyExc_TypeError, "Expected a list of strings");
+        return false;
+    }
+    Py_ssize_t n = PyList_Size(py_list);
+    for (Py_ssize_t i = 0; i < n; i++) {
+        PyObject* item = PyList_GetItem(py_list, i);
+        if (!PyUnicode_Check(item)) {
+            PyErr_SetString(PyExc_TypeError, "Expected a list of strings");
+            return false;
+        }
+        out.emplace_back(PyUnicode_AsUTF8(item));
+    }
+    return true;
+}
+
+static int PyBeliefSolver_init(PyBeliefSolver* self, PyObject* args, PyObject* kwds) {
+    self->cpp_obj = new std::shared_ptr<BeliefSolver>(std::make_shared<BeliefSolver>());
+    return 0;
+}
+
+static void PyBeliefSolver_dealloc(PyBeliefSolver* self) {
+    if (self->cpp_obj) { delete self->cpp_obj; self->cpp_obj = nullptr; }
+    Py_TYPE(self)->tp_free((PyObject*)self);
+}
+
+static PyObject* BeliefSolver_add_oneof(PyBeliefSolver* self, PyObject* args) {
+    PyObject* py_list;
+    if (!PyArg_ParseTuple(args, "O", &py_list)) return NULL;
+    std::vector<std::string> lits;
+    if (!py_list_to_strings(py_list, lits)) return NULL;
+    (*self->cpp_obj)->add_oneof(lits);
+    Py_RETURN_NONE;
+}
+
+static PyObject* BeliefSolver_add_clause(PyBeliefSolver* self, PyObject* args) {
+    PyObject* py_list;
+    if (!PyArg_ParseTuple(args, "O", &py_list)) return NULL;
+    std::vector<std::string> lits;
+    if (!py_list_to_strings(py_list, lits)) return NULL;
+    (*self->cpp_obj)->add_clause(lits);
+    Py_RETURN_NONE;
+}
+
+static PyObject* BeliefSolver_set_unknown(PyBeliefSolver* self, PyObject* args) {
+    PyObject* py_list;
+    if (!PyArg_ParseTuple(args, "O", &py_list)) return NULL;
+    std::vector<std::string> names;
+    if (!py_list_to_strings(py_list, names)) return NULL;
+    (*self->cpp_obj)->set_unknown(names);
+    Py_RETURN_NONE;
+}
+
+static PyObject* BeliefSolver_propagate(PyBeliefSolver* self, PyObject* args) {
+    PyObject* py_list;
+    if (!PyArg_ParseTuple(args, "O", &py_list)) return NULL;
+    std::vector<std::string> facts;
+    if (!py_list_to_strings(py_list, facts)) return NULL;
+
+    auto result = (*self->cpp_obj)->propagate(facts);
+    if (!result.has_value()) Py_RETURN_NONE;  // contradiction
+
+    PyObject* out = PyList_New(0);
+    if (!out) return NULL;
+    for (const auto& f : *result) {
+        PyObject* s = PyUnicode_FromString(f.c_str());
+        if (!s) { Py_DECREF(out); return NULL; }
+        PyList_Append(out, s);
+        Py_DECREF(s);
+    }
+    return out;
+}
+
+static PyObject* BeliefSolver_is_consistent(PyBeliefSolver* self, PyObject* args) {
+    PyObject* py_list;
+    if (!PyArg_ParseTuple(args, "O", &py_list)) return NULL;
+    std::vector<std::string> facts;
+    if (!py_list_to_strings(py_list, facts)) return NULL;
+    if ((*self->cpp_obj)->is_consistent(facts)) Py_RETURN_TRUE;
+    Py_RETURN_FALSE;
+}
+
+static PyObject* BeliefSolver_complete(PyBeliefSolver* self, PyObject* args) {
+    PyObject* py_list;
+    if (!PyArg_ParseTuple(args, "O", &py_list)) return NULL;
+    std::vector<std::string> facts;
+    if (!py_list_to_strings(py_list, facts)) return NULL;
+
+    auto result = (*self->cpp_obj)->complete(facts);
+    if (!result.has_value()) Py_RETURN_NONE;  // unsatisfiable
+
+    PyObject* out = PyList_New(0);
+    if (!out) return NULL;
+    for (const auto& f : *result) {
+        PyObject* s = PyUnicode_FromString(f.c_str());
+        if (!s) { Py_DECREF(out); return NULL; }
+        PyList_Append(out, s);
+        Py_DECREF(s);
+    }
+    return out;
+}
+
+static PyMethodDef BeliefSolver_methods[] = {
+    {"add_oneof", (PyCFunction)BeliefSolver_add_oneof, METH_VARARGS, "Add an exactly-one-of constraint (list of literals)"},
+    {"add_clause", (PyCFunction)BeliefSolver_add_clause, METH_VARARGS, "Add a disjunctive (or) clause (list of literals)"},
+    {"set_unknown", (PyCFunction)BeliefSolver_set_unknown, METH_VARARGS, "Register the initially-unknown fact names"},
+    {"propagate", (PyCFunction)BeliefSolver_propagate, METH_VARARGS, "Closure of given literals, or None if inconsistent"},
+    {"is_consistent", (PyCFunction)BeliefSolver_is_consistent, METH_VARARGS, "Whether the given literals are satisfiable"},
+    {"complete", (PyCFunction)BeliefSolver_complete, METH_VARARGS, "One satisfying model (true vars) consistent with the given literals, or None"},
+    {NULL}
+};
+
 // 7. Deallocators (Safe deletion)
 static void PyPredicate_dealloc(PyPredicate* self) { if (self->cpp_obj) { delete self->cpp_obj; self->cpp_obj = nullptr; } Py_TYPE(self)->tp_free((PyObject*)self); }
 static void PyPredicateNode_dealloc(PyPredicateNode* self) { if (self->cpp_obj) { delete self->cpp_obj; self->cpp_obj = nullptr; } Py_TYPE(self)->tp_free((PyObject*)self); }
@@ -345,9 +416,11 @@ PyMODINIT_FUNC PyInit_cpor_engine(void) {
     PyNotNodeType.tp_name = "cpor_engine.NotNode"; PyNotNodeType.tp_basicsize = sizeof(PyNotNode); PyNotNodeType.tp_dealloc = (destructor)PyNotNode_dealloc; PyNotNodeType.tp_methods = ASTNode_methods; PyNotNodeType.tp_init = (initproc)PyNotNode_init; PyNotNodeType.tp_new = PyType_GenericNew; PyNotNodeType.tp_flags = Py_TPFLAGS_DEFAULT;
     PyActionType.tp_name = "cpor_engine.Action"; PyActionType.tp_basicsize = sizeof(PyAction); PyActionType.tp_dealloc = (destructor)PyAction_dealloc; PyActionType.tp_methods = Action_methods; PyActionType.tp_init = (initproc)PyAction_init; PyActionType.tp_new = PyType_GenericNew; PyActionType.tp_flags = Py_TPFLAGS_DEFAULT;
     PyBeliefStateType.tp_name = "cpor_engine.BeliefState"; PyBeliefStateType.tp_basicsize = sizeof(PyBeliefState); PyBeliefStateType.tp_dealloc = (destructor)PyBeliefState_dealloc; PyBeliefStateType.tp_methods = BeliefState_methods; PyBeliefStateType.tp_init = (initproc)PyBeliefState_init; PyBeliefStateType.tp_new = PyType_GenericNew; PyBeliefStateType.tp_flags = Py_TPFLAGS_DEFAULT;
+    PyBeliefSolverType.tp_name = "cpor_engine.BeliefSolver"; PyBeliefSolverType.tp_basicsize = sizeof(PyBeliefSolver); PyBeliefSolverType.tp_dealloc = (destructor)PyBeliefSolver_dealloc; PyBeliefSolverType.tp_methods = BeliefSolver_methods; PyBeliefSolverType.tp_init = (initproc)PyBeliefSolver_init; PyBeliefSolverType.tp_new = PyType_GenericNew; PyBeliefSolverType.tp_flags = Py_TPFLAGS_DEFAULT;
     if (PyType_Ready(&PyPredicateType) < 0 || PyType_Ready(&PyPredicateNodeType) < 0 ||
-        PyType_Ready(&PyAndNodeType) < 0 || PyType_Ready(&PyOrNodeType) < 0 || 
-        PyType_Ready(&PyNotNodeType) < 0 || PyType_Ready(&PyActionType) < 0 || PyType_Ready(&PyBeliefStateType) < 0) return NULL;
+        PyType_Ready(&PyAndNodeType) < 0 || PyType_Ready(&PyOrNodeType) < 0 ||
+        PyType_Ready(&PyNotNodeType) < 0 || PyType_Ready(&PyActionType) < 0 || PyType_Ready(&PyBeliefStateType) < 0 ||
+        PyType_Ready(&PyBeliefSolverType) < 0) return NULL;
 
     PyObject* m = PyModule_Create(&cpor_engine_module);
     if (!m) return NULL;
@@ -359,6 +432,7 @@ PyMODINIT_FUNC PyInit_cpor_engine(void) {
     Py_INCREF(&PyNotNodeType); PyModule_AddObject(m, "NotNode", (PyObject *)&PyNotNodeType);
     Py_INCREF(&PyActionType); PyModule_AddObject(m, "Action", (PyObject *)&PyActionType);
     Py_INCREF(&PyBeliefStateType); PyModule_AddObject(m, "BeliefState", (PyObject *)&PyBeliefStateType);
+    Py_INCREF(&PyBeliefSolverType); PyModule_AddObject(m, "BeliefSolver", (PyObject *)&PyBeliefSolverType);
 
     return m;
 }

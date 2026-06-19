@@ -1,5 +1,4 @@
 import os
-import sys
 import cpor_engine
 from unified_planning.io import PDDLReader
 from up_cpor.native_engine import NativeSDRImpl as SDRImpl, CPORMetaPlanner
@@ -37,8 +36,8 @@ def print_plan_tree(node, depth=0, path=None):
 
 def main():
     print("--- CPOR Hybrid Engine Initialization ---")
-    domain_file = "../tests/blocks2/d.pddl"
-    problem_file = "../tests/blocks2/p.pddl"
+    domain_file = "../tests/blocks7/d.pddl"
+    problem_file = "../tests/blocks7/p.pddl"
     
     if not os.path.exists(domain_file):
         return print("Error: Could not find PDDL files")
@@ -47,16 +46,14 @@ def main():
     problem = reader.parse_problem(domain_file, problem_file)
     
     cpp_initial_state = convert_up_state_to_cpp(problem.initial_values)
-    initial_belief = cpor_engine.BeliefState()
-    for p in cpp_initial_state:
-        initial_belief.add_observed(p)
-    
+    initial_true = {p.get_name() for p in cpp_initial_state}
+
     print("\nInitializing Online Planner (SDR)...")
-    online_planner = SDRImpl(problem=problem)
+    online_planner = SDRImpl(problem=problem, problem_file=problem_file)
     meta_planner = CPORMetaPlanner(simulator=None, online_planner=online_planner)
-    
+
     print("\n--- Generating Native C++ Contingent Plan Graph ---\n")
-    plan_graph = meta_planner.build_plan_graph(initial_belief)
+    plan_graph = meta_planner.build_plan_graph(meta_planner.make_initial_belief(initial_true))
     
     print_plan_tree(plan_graph)
     print("\n✅ Plan Graph Generation Complete!")
