@@ -365,27 +365,79 @@ class NativeSDRImpl:
             return self._follow_committed_plan(belief.with_plan(tuple(plan)), current_facts) \
                 or (None, belief)
 
-        # 3. Nothing usable: explore by sensing a currently-unknown fluent.
+        # 3. Nothing usable: explore by sensing a currently-unknown fluent that is
+        #    directly applicable now.
         for name in sorted(self.dynamic_actions):
             act = self.dynamic_actions[name]
             if (act.is_sensing and act.observe in self.sat_solver.unknown_facts
                     and belief.known_value(act.observe) is None
                     and act.preconditions <= current_facts):
                 return act, belief
+
+        # 4. Plan-to-observe: no sensing action is applicable right now and the
+        #    classical relaxation found no plan to the goal, so we would otherwise
+        #    declare a dead end. Before giving up, try to PLAN toward an unknown
+        #    sensing action's preconditions (e.g. move to a cell where we can sense)
+        #    so the observation can resolve the uncertainty. Mirrors the C# CPOR
+        #    PlanToObserveDeadEnd step.
+        chosen = self._plan_to_observe(belief, current_facts)
+        if chosen is not None:
+            return chosen
+
         return None, belief
 
-    KT_MAX_WORLDS = 300  # cap on possible worlds (tags) handed to the KT translation.
+    def _plan_to_observe(self, belief, current_facts):
+        """When stuck (no goal plan, no directly-applicable sensing action), plan a
+        classical path toward an unknown sensing action's preconditions, commit it,
+        and follow it (the sensing action itself is appended so it fires on arrival).
+        Returns (action, belief) or None if nothing can be set up to observe."""
+        model = self.sat_solver.complete(belief.initial_known)
+        if model is None:
+            return None
+        full_state = set(model) | {f for f in belief.initial_known if not f.startswith("NOT_")}
+        for act in belief.history:
+            full_state -= act.del_effects
+            full_state |= act.add_effects
+
+        for name in sorted(self.dynamic_actions):
+            act = self.dynamic_actions[name]
+            if not (act.is_sensing and act.observe in self.sat_solver.unknown_facts
+                    and belief.known_value(act.observe) is None):
+                continue
+            if act.preconditions <= current_facts:
+                continue  # would already have been picked by step 3
+            if not act.preconditions:
+                continue
+            goal = [(p, True) for p in sorted(act.preconditions)]
+            plan = self._run_cpp_ff_plan(full_state, goal=goal)
+            if plan:
+                committed = belief.with_plan(tuple(plan) + (name,))
+                chosen = self._follow_committed_plan(committed, current_facts)
+                if chosen is not None:
+                    return chosen
+        return None
+
+    # The KT translation emits one classical predicate per (uncertain fluent x tag),
+    # so the FF domain size is driven by the number of DISTINCT tags, not the number
+    # of possible worlds (worlds usually collapse to far fewer distinct projections
+    # onto the uncertain fluents). So we enumerate up to MODEL_ENUM_CAP worlds (we
+    # must see them ALL for the KT merge actions to stay sound) and then cap the KT
+    # path on the number of DISTINCT tags. This lets problems with many worlds but
+    # few distinct tags still take the sound KT path instead of the fallback.
+    MODEL_ENUM_CAP = 4000   # max worlds we will enumerate (soundness needs all of them)
+    KT_MAX_TAGS = 300       # max distinct tags handed to FF (tractability of the KT domain)
 
     def _kt_determinize(self, belief):
         """SDR determinization via the KT (knowledge) translation. Returns a
         committed plan of canonical (real + sensing) action names, or [] to defer
         to the fallback determinizer."""
         init_models = self.sat_solver.enumerate_models(list(belief.initial_known),
-                                                       self.KT_MAX_WORLDS + 1)
-        # Defer to the fallback when there are no worlds, when the belief is
-        # already certain (no uncertainty to translate), or when there are more
-        # possible worlds than the KT path is currently validated for.
-        if not init_models or len(init_models) > self.KT_MAX_WORLDS:
+                                                       self.MODEL_ENUM_CAP + 1)
+        # Defer to the fallback when there are no worlds, or when there are more
+        # possible worlds than we can enumerate -- a partial enumeration would make
+        # the KT merge actions unsound (they could conclude knowledge an unseen
+        # world contradicts).
+        if not init_models or len(init_models) > self.MODEL_ENUM_CAP:
             return []
 
         known_pos = {f for f in belief.initial_known if not f.startswith("NOT_")}
@@ -412,6 +464,11 @@ class NativeSDRImpl:
                 seen.add(t)
                 tags.append(t)
 
+        # Too many distinct tags -> the KT-translated FF domain would be too large;
+        # defer to the (cheaper, single-world) fallback determinizer.
+        if len(tags) > self.KT_MAX_TAGS:
+            return []
+
         actions_arg = [(a["name"], a["is_sensing"], a["observe"], a["pre"], a["add"], a["del"])
                        for a in self.kt_action_info]
         domain, problem = cpor_engine.kt_translate(
@@ -434,11 +491,9 @@ class NativeSDRImpl:
         return plan
 
     def _ff_solve_pddl(self, domain_str, problem_str):
-        with open("temp_kt_d.pddl", "w") as f:
-            f.write(domain_str)
-        with open("temp_kt_p.pddl", "w") as f:
-            f.write(problem_str)
-        return cpor_engine.ff_solve("temp_kt_d.pddl", "temp_kt_p.pddl")
+        # In-memory: FF parses the PDDL straight from these strings (fmemopen),
+        # so nothing is written to disk.
+        return cpor_engine.ff_solve_strings(domain_str, problem_str)
 
     def _ff_plan_cached(self, facts_frozenset):
         if facts_frozenset in self.ff_cache:
@@ -495,14 +550,16 @@ class NativeSDRImpl:
         # checks recorded without polarity); the action is effectively applicable.
         return act, belief
 
-    def _run_cpp_ff_plan(self, facts):
+    def _run_cpp_ff_plan(self, facts, goal=None):
         """Classical relaxation for an assumed world `facts`: the KT translation
         with no uncertainty (uncertain={}) yields a plain classical problem over
         the full contingent-grounded actions (sensing actions are dropped). Returns
-        the plan as canonical grounded action names."""
+        the plan as canonical grounded action names. ``goal`` overrides the problem
+        goal (used by plan-to-observe to plan toward a sensing precondition)."""
         actions_arg = [(a["name"], a["is_sensing"], a["observe"], a["pre"], a["add"], a["del"])
                        for a in self.kt_action_info]
-        domain, problem = cpor_engine.kt_translate(actions_arg, [], [], sorted(facts), self.goal_literals)
+        domain, problem = cpor_engine.kt_translate(
+            actions_arg, [], [], sorted(facts), self.goal_literals if goal is None else goal)
         raw = self._ff_solve_pddl(domain, problem)
         plan = []
         for step in raw:

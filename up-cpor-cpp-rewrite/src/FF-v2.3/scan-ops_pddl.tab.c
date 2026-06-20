@@ -2435,10 +2435,13 @@ void load_ops_file( char *filename )
 
   FILE * fp;/* pointer to input files */
   char tmp[MAX_LENGTH] = "";
+  extern FILE *gff_ops_override;/* in-memory PDDL stream, set by ff_solve_strings */
 
-  /* open operator file 
+  /* open operator file (or use the in-memory stream if one was provided)
    */
-  if( ( fp = fopen( filename, "r" ) ) == NULL ) {
+  if ( gff_ops_override != NULL ) {
+    fp = gff_ops_override;
+  } else if( ( fp = fopen( filename, "r" ) ) == NULL ) {
     sprintf(tmp, "\nff: can't find operator file: %s\n\n", filename );
     perror(tmp);
     exit( 1 );

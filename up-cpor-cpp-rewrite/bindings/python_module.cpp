@@ -41,6 +41,33 @@ static PyObject* py_ff_solve(PyObject* self, PyObject* args) {
     return py_list;
 }
 
+// ff_solve_strings(domain_str, problem_str) -> list[str]
+// Same as ff_solve but parses the PDDL from in-memory strings (no temp files).
+static PyObject* py_ff_solve_strings(PyObject* self, PyObject* args) {
+    const char* domain_str;
+    const char* problem_str;
+    Py_ssize_t domain_len, problem_len;
+    if (!PyArg_ParseTuple(args, "s#s#", &domain_str, &domain_len,
+                          &problem_str, &problem_len)) return NULL;
+
+    std::vector<std::string> plan;
+    std::string dom(domain_str, domain_len);
+    std::string prob(problem_str, problem_len);
+    Py_BEGIN_ALLOW_THREADS
+    plan = ff_solve_strings(dom, prob);
+    Py_END_ALLOW_THREADS
+
+    PyObject* py_list = PyList_New(0);
+    if (!py_list) return NULL;
+    for (const auto& step : plan) {
+        PyObject* s = PyUnicode_FromString(step.c_str());
+        if (!s) { Py_DECREF(py_list); return NULL; }
+        PyList_Append(py_list, s);
+        Py_DECREF(s);
+    }
+    return py_list;
+}
+
 // Parse a Python list of (str, bool) tuples.
 static bool parse_literal_list(PyObject* py_list, std::vector<std::pair<std::string, bool>>& out) {
     if (!PyList_Check(py_list)) { PyErr_SetString(PyExc_TypeError, "expected a list"); return false; }
@@ -100,6 +127,8 @@ static PyObject* py_kt_translate(PyObject* self, PyObject* args) {
 static PyMethodDef cpor_engine_functions[] = {
     {"ff_solve", (PyCFunction)py_ff_solve, METH_VARARGS,
      "ff_solve(domain_path, problem_path) -> list[str]: run Metric-FF, return the plan."},
+    {"ff_solve_strings", (PyCFunction)py_ff_solve_strings, METH_VARARGS,
+     "ff_solve_strings(domain_str, problem_str) -> list[str]: run Metric-FF on in-memory PDDL."},
     {"kt_translate", (PyCFunction)py_kt_translate, METH_VARARGS,
      "kt_translate(actions, uncertain, tags, known_true, goal) -> (domain, problem): KT translation."},
     {NULL, NULL, 0, NULL}
@@ -248,41 +277,6 @@ static int PyAndNode_init(PyAndNode* self, PyObject* args, PyObject* kwds) {
     self->cpp_obj = new std::shared_ptr<AndNode>(std::make_shared<AndNode>(children));
     return 0;
 }
-static PyObject* BeliefState_get_observed(PyBeliefState* self, PyObject* args) {
-    if (!self->cpp_obj || !*self->cpp_obj) { PyErr_SetString(PyExc_RuntimeError, "BeliefState uninitialized"); return NULL; }
-    
-    const auto& obs = (*self->cpp_obj)->get_observed();
-    PyObject* new_py_list = PyList_New(0);
-    
-    for (const auto& pred : obs) {
-        PyObject* py_str = PyUnicode_FromString(pred->get_name().c_str());
-        PyObject* init_args = PyTuple_Pack(1, py_str);
-        PyObject* py_pred = PyObject_CallObject((PyObject*)&PyPredicateType, init_args);
-        Py_DECREF(init_args);
-        Py_DECREF(py_str);
-
-        if (py_pred) {
-            PyList_Append(new_py_list, py_pred);
-            Py_DECREF(py_pred);
-        }
-    }
-    return new_py_list;
-}
-
-static PyMethodDef BeliefState_methods[] = {
-    {"add_observed", (PyCFunction)BeliefState_add_observed, METH_VARARGS, "Add an observed predicate"},
-    {"get_observed", (PyCFunction)BeliefState_get_observed, METH_NOARGS, "Get list of observed predicates"},
-    {NULL}
-};
-
-static PyMethodDef Action_methods[] = {
-    {"set_precondition", (PyCFunction)Action_set_precondition, METH_VARARGS, "Set AST precondition"},
-    {"add_effect", (PyCFunction)Action_add_effect, METH_VARARGS, "Add effect (predicate, is_add)"},
-    {"set_observe", (PyCFunction)Action_set_observe, METH_VARARGS, "Set predicate for sensing"},
-    {"is_applicable", (PyCFunction)Action_is_applicable, METH_VARARGS, "Check if allowed in state"},
-    {"apply", (PyCFunction)Action_apply, METH_VARARGS, "Apply effects and return new state"},
-    {NULL}
-};
 
 // 6b. BeliefSolver (Z3-backed reasoning over initial-state constraints)
 static bool py_list_to_strings(PyObject* py_list, std::vector<std::string>& out) {
@@ -404,7 +398,6 @@ static void PyPredicateNode_dealloc(PyPredicateNode* self) { if (self->cpp_obj) 
 static void PyAndNode_dealloc(PyAndNode* self) { if (self->cpp_obj) { delete self->cpp_obj; self->cpp_obj = nullptr; } Py_TYPE(self)->tp_free((PyObject*)self); }
 static void PyOrNode_dealloc(PyOrNode* self) { if (self->cpp_obj) { delete self->cpp_obj; self->cpp_obj = nullptr; } Py_TYPE(self)->tp_free((PyObject*)self); }
 static void PyNotNode_dealloc(PyNotNode* self) { if (self->cpp_obj) { delete self->cpp_obj; self->cpp_obj = nullptr; } Py_TYPE(self)->tp_free((PyObject*)self); }
-static void PyAction_dealloc(PyAction* self) { if (self->cpp_obj) { delete self->cpp_obj; self->cpp_obj = nullptr; } Py_TYPE(self)->tp_free((PyObject*)self); }
 
 // 8. Initialization
 PyMODINIT_FUNC PyInit_cpor_engine(void) {
@@ -414,13 +407,10 @@ PyMODINIT_FUNC PyInit_cpor_engine(void) {
     PyAndNodeType.tp_name = "cpor_engine.AndNode"; PyAndNodeType.tp_basicsize = sizeof(PyAndNode); PyAndNodeType.tp_dealloc = (destructor)PyAndNode_dealloc; PyAndNodeType.tp_methods = ASTNode_methods; PyAndNodeType.tp_init = (initproc)PyAndNode_init; PyAndNodeType.tp_new = PyType_GenericNew; PyAndNodeType.tp_flags = Py_TPFLAGS_DEFAULT;
     PyOrNodeType.tp_name = "cpor_engine.OrNode"; PyOrNodeType.tp_basicsize = sizeof(PyOrNode); PyOrNodeType.tp_dealloc = (destructor)PyOrNode_dealloc; PyOrNodeType.tp_methods = ASTNode_methods; PyOrNodeType.tp_init = (initproc)PyOrNode_init; PyOrNodeType.tp_new = PyType_GenericNew; PyOrNodeType.tp_flags = Py_TPFLAGS_DEFAULT;
     PyNotNodeType.tp_name = "cpor_engine.NotNode"; PyNotNodeType.tp_basicsize = sizeof(PyNotNode); PyNotNodeType.tp_dealloc = (destructor)PyNotNode_dealloc; PyNotNodeType.tp_methods = ASTNode_methods; PyNotNodeType.tp_init = (initproc)PyNotNode_init; PyNotNodeType.tp_new = PyType_GenericNew; PyNotNodeType.tp_flags = Py_TPFLAGS_DEFAULT;
-    PyActionType.tp_name = "cpor_engine.Action"; PyActionType.tp_basicsize = sizeof(PyAction); PyActionType.tp_dealloc = (destructor)PyAction_dealloc; PyActionType.tp_methods = Action_methods; PyActionType.tp_init = (initproc)PyAction_init; PyActionType.tp_new = PyType_GenericNew; PyActionType.tp_flags = Py_TPFLAGS_DEFAULT;
-    PyBeliefStateType.tp_name = "cpor_engine.BeliefState"; PyBeliefStateType.tp_basicsize = sizeof(PyBeliefState); PyBeliefStateType.tp_dealloc = (destructor)PyBeliefState_dealloc; PyBeliefStateType.tp_methods = BeliefState_methods; PyBeliefStateType.tp_init = (initproc)PyBeliefState_init; PyBeliefStateType.tp_new = PyType_GenericNew; PyBeliefStateType.tp_flags = Py_TPFLAGS_DEFAULT;
     PyBeliefSolverType.tp_name = "cpor_engine.BeliefSolver"; PyBeliefSolverType.tp_basicsize = sizeof(PyBeliefSolver); PyBeliefSolverType.tp_dealloc = (destructor)PyBeliefSolver_dealloc; PyBeliefSolverType.tp_methods = BeliefSolver_methods; PyBeliefSolverType.tp_init = (initproc)PyBeliefSolver_init; PyBeliefSolverType.tp_new = PyType_GenericNew; PyBeliefSolverType.tp_flags = Py_TPFLAGS_DEFAULT;
     if (PyType_Ready(&PyPredicateType) < 0 || PyType_Ready(&PyPredicateNodeType) < 0 ||
         PyType_Ready(&PyAndNodeType) < 0 || PyType_Ready(&PyOrNodeType) < 0 ||
-        PyType_Ready(&PyNotNodeType) < 0 || PyType_Ready(&PyActionType) < 0 || PyType_Ready(&PyBeliefStateType) < 0 ||
-        PyType_Ready(&PyBeliefSolverType) < 0) return NULL;
+        PyType_Ready(&PyNotNodeType) < 0 || PyType_Ready(&PyBeliefSolverType) < 0) return NULL;
 
     PyObject* m = PyModule_Create(&cpor_engine_module);
     if (!m) return NULL;
@@ -430,8 +420,6 @@ PyMODINIT_FUNC PyInit_cpor_engine(void) {
     Py_INCREF(&PyAndNodeType); PyModule_AddObject(m, "AndNode", (PyObject *)&PyAndNodeType);
     Py_INCREF(&PyOrNodeType); PyModule_AddObject(m, "OrNode", (PyObject *)&PyOrNodeType);
     Py_INCREF(&PyNotNodeType); PyModule_AddObject(m, "NotNode", (PyObject *)&PyNotNodeType);
-    Py_INCREF(&PyActionType); PyModule_AddObject(m, "Action", (PyObject *)&PyActionType);
-    Py_INCREF(&PyBeliefStateType); PyModule_AddObject(m, "BeliefState", (PyObject *)&PyBeliefStateType);
     Py_INCREF(&PyBeliefSolverType); PyModule_AddObject(m, "BeliefSolver", (PyObject *)&PyBeliefSolverType);
 
     return m;

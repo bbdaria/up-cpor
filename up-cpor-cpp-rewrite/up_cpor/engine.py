@@ -118,7 +118,7 @@ class CPORMetaEngineImpl(MetaEngine, mixins.OneshotPlannerMixin):
 
             # _to_contingent_node accesses grounded_action_map (lazily grounded via
             # the UP grounder), which must run inside the environment swap.
-            root = _to_contingent_node(graph, online, problem)
+            root = _to_contingent_node(graph, online, problem, {})
         finally:
             up_environment.GLOBAL_ENVIRONMENT = previous_env
 
@@ -137,21 +137,34 @@ def _contains_dead_end(node) -> bool:
     return any(_contains_dead_end(child) for _label, child in node["children"])
 
 
-def _to_contingent_node(node, online, problem) -> Optional[ContingentPlanNode]:
-    """Translate the native plan-graph dict into a UP ContingentPlanNode tree.
+def _to_contingent_node(node, online, problem, memo) -> Optional[ContingentPlanNode]:
+    """Translate the native plan-graph into a UP ContingentPlanNode graph.
 
     Leaves ("GOAL REACHED"/"DEAD END") become None: a branch that terminates at
     the goal is simply an action node with no child for that observation.
+
+    The native graph is already a DAG -- CPORMetaPlanner.build_plan_graph caches
+    nodes by belief signature and returns the SAME dict object for a revisited
+    belief. ``memo`` (keyed by the node's identity) preserves that sharing here so
+    the resulting ContingentPlan is the compacted graph of Maliah et al. (2021),
+    not a re-expanded tree. Registering ``cpn`` before recursing also makes any
+    back-edge (a belief that reaches one of its own ancestors) reuse the in-progress
+    node instead of recursing forever.
     """
     if node is None or node["action"] in _LEAVES:
         return None
 
+    key = id(node)
+    if key in memo:
+        return memo[key]
+
     action = online.grounded_action_map[node["action"]]
     cpn = ContingentPlanNode(ActionInstance(action))
+    memo[key] = cpn
 
     em = problem.environment.expression_manager
     for label, child in node["children"]:
-        child_node = _to_contingent_node(child, online, problem)
+        child_node = _to_contingent_node(child, online, problem, memo)
         if child_node is None:
             continue
         if label == "Deterministically":

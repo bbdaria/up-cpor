@@ -1,9 +1,10 @@
 """Drive CPORMetaEngineImpl through unified-planning's MetaEngine API.
 
-Wraps a minimal dummy classical engine to satisfy the MetaEngine contract; the
-actual classical planning is done internally by the bundled Metric-FF (so the
-wrapped engine is never used for a real plan). Marked ``planner`` (needs
-unified_planning + in-process FF).
+Parameterises the MetaEngine with the real bundled Metric-FF (``up_cpor.ff_engine``)
+exposed as a classical OneshotPlanner, so the planner is ``CPORPlanning[ff]``. CPOR
+performs its contingent classical sub-solving internally via the same FF; the wrapped
+engine is the public-API formality (as in the original up-cpor). Marked ``planner``
+(needs unified_planning + in-process FF).
 """
 import os
 import pytest
@@ -30,7 +31,7 @@ def _chdir_rewrite_root(monkeypatch):
 def _make_env():
     env = up_environment.Environment()
     env.credits_stream = None
-    env.factory.add_engine("dummy", "_dummy_classical", "DummyClassical")
+    env.factory.add_engine("ff", "up_cpor.ff_engine", "FFEngine")
     env.factory.add_meta_engine("MetaCPORPlanning", "up_cpor.engine", "CPORMetaEngineImpl")
     return env
 
@@ -42,7 +43,7 @@ def _solve(domain):
     p = os.path.join(_REPO_ROOT, "tests", domain, "p.pddl")
     problem = reader.parse_problem(d, p)
     with env.factory.OneshotPlanner(
-        name="MetaCPORPlanning[dummy]", params={"random_seed": 0}
+        name="MetaCPORPlanning[ff]", params={"random_seed": 0}
     ) as planner:
         return planner.solve(problem)
 

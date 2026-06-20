@@ -50,12 +50,7 @@ def test_kt_blocks3_root_plan_uses_sense_and_merge():
     domain, prob = cpor_engine.kt_translate(
         actions_arg, sorted(uncertain), [list(t) for t in tags],
         sorted(known_true), sdr.goal_literals)
-    with open("temp_kt_d.pddl", "w") as f:
-        f.write(domain)
-    with open("temp_kt_p.pddl", "w") as f:
-        f.write(prob)
-
-    plan = [s.lower().split()[0] for s in cpor_engine.ff_solve("temp_kt_d.pddl", "temp_kt_p.pddl") if s.strip()]
+    plan = [s.lower().split()[0] for s in cpor_engine.ff_solve_strings(domain, prob) if s.strip()]
     assert plan, "KT problem should be solvable"
     # faithful KT behaviour: at least one sensing action and one merge inference
     assert any(name.startswith("sense") for name in plan), plan

@@ -749,3 +749,8 @@ $RECYCLE.BIN/
 *.lnk
 up-cpor-cpp-rewrite/build/*
 # End of https://www.toptal.com/developers/gitignore/api/python,visualstudiocode,macos,windows,linux,csharp,pycharm+all
+up-cpor-cpp-rewrite/docs/IMPLEMENTATION.md
+.gitignore
+up-cpor-cpp-rewrite/docs/build_pdf.py
+up-cpor-cpp-rewrite/docs/IMPLEMENTATION.pdf
+up-cpor-cpp-rewrite/run_generators.py
