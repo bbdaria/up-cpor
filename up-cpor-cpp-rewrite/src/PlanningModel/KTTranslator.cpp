@@ -109,6 +109,22 @@ std::pair<std::string, std::string> kt_translate(
                     eff.push_back("(not (" + san(f) + "))");
                 }
             }
+
+            for (const auto& c : a.cond) {
+                const auto& cond_lits = std::get<0>(c);
+                const std::string& fluent = std::get<1>(c);
+                bool is_add = std::get<2>(c);
+                std::ostringstream when;
+                when << "(when (and";
+                for (const auto& cl : cond_lits) {
+                    if (!uncertain.count(cl.first)) preds.insert("(" + san(cl.first) + ")");
+                    when << " " << lit_atom(cl.first, cl.second, uncertain);
+                }
+                when << ") " << lit_atom(fluent, is_add, uncertain) << ")";
+                if (!uncertain.count(fluent)) preds.insert("(" + san(fluent) + ")");
+                eff.push_back(when.str());
+            }
+
             if (!eff.empty()) blocks.push_back(mk_action(name, pre, eff));
         } else {
             const std::string& p = a.observe;

@@ -36,8 +36,8 @@ def print_plan_tree(node, depth=0, path=None):
 
 def main():
     print("--- CPOR Hybrid Engine Initialization ---")
-    domain_file = "../tests/blocks7/d.pddl"
-    problem_file = "../tests/blocks7/p.pddl"
+    domain_file = "../tests/localize5/d.pddl"
+    problem_file = "../tests/localize5/p.pddl"
     
     if not os.path.exists(domain_file):
         return print("Error: Could not find PDDL files")

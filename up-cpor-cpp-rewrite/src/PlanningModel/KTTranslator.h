@@ -18,6 +18,7 @@ struct KTAction {
     std::vector<std::pair<std::string, bool>> pre;  // (fluent, polarity)
     std::vector<std::string> add;
     std::vector<std::string> del;
+    std::vector<std::tuple<std::vector<std::pair<std::string, bool>>, std::string, bool>> cond;
 };
 
 // tags[i] = set of uncertain-fluent names true in possible world i (tag 0 is the
