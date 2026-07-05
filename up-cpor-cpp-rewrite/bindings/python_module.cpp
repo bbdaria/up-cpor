@@ -91,9 +91,9 @@ static PyObject* py_kt_translate(PyObject* self, PyObject* args) {
     std::vector<KTAction> actions;
     if (!PyList_Check(py_actions)) { PyErr_SetString(PyExc_TypeError, "actions must be a list"); return NULL; }
     for (Py_ssize_t i = 0; i < PyList_Size(py_actions); i++) {
-        PyObject *name, *is_sensing, *observe, *pre, *add, *del;
-        if (!PyArg_ParseTuple(PyList_GetItem(py_actions, i), "OOOOOO",
-                              &name, &is_sensing, &observe, &pre, &add, &del))
+        PyObject *name, *is_sensing, *observe, *pre, *add, *del, *cond = NULL;
+        if (!PyArg_ParseTuple(PyList_GetItem(py_actions, i), "OOOOOO|O",
+                              &name, &is_sensing, &observe, &pre, &add, &del, &cond))
             return NULL;
         KTAction a;
         a.name = PyUnicode_AsUTF8(name);
@@ -102,6 +102,20 @@ static PyObject* py_kt_translate(PyObject* self, PyObject* args) {
         if (!parse_literal_list(pre, a.pre)) return NULL;
         if (!py_list_to_strings(add, a.add)) return NULL;
         if (!py_list_to_strings(del, a.del)) return NULL;
+        if (cond != NULL) {
+            if (!PyList_Check(cond)) { PyErr_SetString(PyExc_TypeError, "cond must be a list"); return NULL; }
+            for (Py_ssize_t j = 0; j < PyList_Size(cond); j++) {
+                PyObject *cond_lits_py, *fluent_py, *is_add_py;
+                if (!PyArg_ParseTuple(PyList_GetItem(cond, j), "OOO",
+                                      &cond_lits_py, &fluent_py, &is_add_py))
+                    return NULL;
+                std::vector<std::pair<std::string, bool>> cond_lits;
+                if (!parse_literal_list(cond_lits_py, cond_lits)) return NULL;
+                std::string fluent = PyUnicode_AsUTF8(fluent_py);
+                bool is_add = PyObject_IsTrue(is_add_py) == 1;
+                a.cond.emplace_back(std::move(cond_lits), std::move(fluent), is_add);
+            }
+        }
         actions.push_back(std::move(a));
     }
 
@@ -123,6 +137,61 @@ static PyObject* py_kt_translate(PyObject* self, PyObject* args) {
     auto result = kt_translate(actions, uncertain, tags, known_true, goal);
     return Py_BuildValue("ss", result.first.c_str(), result.second.c_str());
 }
+
+// static PyObject* py_kt_translate(PyObject* self, PyObject* args) {
+//     // PyObject *py_actions, *py_uncertain, *py_tags, *py_known, *py_goal;
+//     // if (!PyArg_ParseTuple(args, "OOOOO", &py_actions, &py_uncertain, &py_tags, &py_known, &py_goal))
+//     //     return NULL;
+//     PyObject *name, *is_sensing, *observe, *pre, *add, *del, *cond = NULL;
+//     if (!PyArg_ParseTuple(PyList_GetItem(py_actions, i), "OOOOOO|O",
+//                         &name, &is_sensing, &observe, &pre, &add, &del, &cond))
+//         return NULL;
+
+//     if (cond != NULL) {
+//         for (Py_ssize_t j = 0; j < PyList_Size(cond); j++) {
+//             PyObject *cond_lits_py, *fluent_py, *is_add_py;
+//             PyArg_ParseTuple(PyList_GetItem(cond, j), "OOO", &cond_lits_py, &fluent_py, &is_add_py);
+//             std::vector<std::pair<std::string, bool>> cond_lits;
+//             parse_literal_list(cond_lits_py, cond_lits);
+//             a.cond.emplace_back(std::move(cond_lits), PyUnicode_AsUTF8(fluent_py), PyObject_IsTrue(is_add_py) == 1);
+//         }
+//     }
+
+//     std::vector<KTAction> actions;
+//     if (!PyList_Check(py_actions)) { PyErr_SetString(PyExc_TypeError, "actions must be a list"); return NULL; }
+//     for (Py_ssize_t i = 0; i < PyList_Size(py_actions); i++) {
+//         PyObject *name, *is_sensing, *observe, *pre, *add, *del;
+//         if (!PyArg_ParseTuple(PyList_GetItem(py_actions, i), "OOOOOO",
+//                               &name, &is_sensing, &observe, &pre, &add, &del))
+//             return NULL;
+//         KTAction a;
+//         a.name = PyUnicode_AsUTF8(name);
+//         a.is_sensing = PyObject_IsTrue(is_sensing) == 1;
+//         a.observe = (observe == Py_None) ? "" : PyUnicode_AsUTF8(observe);
+//         if (!parse_literal_list(pre, a.pre)) return NULL;
+//         if (!py_list_to_strings(add, a.add)) return NULL;
+//         if (!py_list_to_strings(del, a.del)) return NULL;
+//         actions.push_back(std::move(a));
+//     }
+
+//     std::vector<std::string> uncertain, known_true;
+//     if (!py_list_to_strings(py_uncertain, uncertain)) return NULL;
+//     if (!py_list_to_strings(py_known, known_true)) return NULL;
+
+//     std::vector<std::vector<std::string>> tags;
+//     if (!PyList_Check(py_tags)) { PyErr_SetString(PyExc_TypeError, "tags must be a list"); return NULL; }
+//     for (Py_ssize_t i = 0; i < PyList_Size(py_tags); i++) {
+//         std::vector<std::string> t;
+//         if (!py_list_to_strings(PyList_GetItem(py_tags, i), t)) return NULL;
+//         tags.push_back(std::move(t));
+//     }
+
+//     std::vector<std::pair<std::string, bool>> goal;
+//     if (!parse_literal_list(py_goal, goal)) return NULL;
+
+//     auto result = kt_translate(actions, uncertain, tags, known_true, goal);
+//     return Py_BuildValue("ss", result.first.c_str(), result.second.c_str());
+// }
 
 static PyMethodDef cpor_engine_functions[] = {
     {"ff_solve", (PyCFunction)py_ff_solve, METH_VARARGS,

@@ -125,10 +125,20 @@ def ground_actions(problem):
             if not ok:
                 continue
 
-            add, dele = [], []
+            # add, dele = [], []
+            # for e in action.effects:
+            #     gname = _fluent_name(e.fluent, binding)
+            #     (add if e.value.is_true() else dele).append(gname)
+            add, dele, cond = [], [], []
             for e in action.effects:
                 gname = _fluent_name(e.fluent, binding)
-                (add if e.value.is_true() else dele).append(gname)
+                if e.condition.is_true():
+                    (add if e.value.is_true() else dele).append(gname)
+                else:
+                    cond_lits = []
+                    _collect_literals(e.condition, binding, cond_lits)
+                    ground_cond = [(g, pol) for (_, g, pol) in cond_lits]
+                    cond.append((ground_cond, gname, e.value.is_true()))
 
             observe = _fluent_name(observed[0], binding) if is_sensing else None
             suffix = "_" + "_".join(binding[p.name] for p in params) if params else ""
@@ -139,5 +149,6 @@ def ground_actions(problem):
                 "pre": dyn_pre,
                 "add": add,
                 "del": dele,
+                "cond": cond
             })
     return infos

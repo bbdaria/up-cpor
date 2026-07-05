@@ -64,6 +64,7 @@ class MiniSATSolver:
         self.unknown_facts = set()
 
         oneof = list(getattr(problem, "oneof_constraints", []))
+        self.oneof_members = {_literal_to_str(x) for group in oneof for x in group}
         or_constraints = list(getattr(problem, "or_constraints", []))
         hidden = getattr(problem, "hidden_fluents", [])
 
@@ -128,117 +129,118 @@ class MiniSATSolver:
         agreeing with current_facts, or None if inconsistent."""
         result = self._solver.complete(list(current_facts))
         return None if result is None else set(result)
+    
+    def add_hidden_clause(self, new_hidden_fact, clause):
+        if new_hidden_fact not in self.unknown_facts:
+            self.unknown_facts.add(new_hidden_fact)
+            self._solver.set_unknown(sorted(self.unknown_facts))
+        self._solver.add_clause(clause)
+        self._zsolver.add(self._z3.Or([self._zlit(c) for c in clause]))
+
+# class DynamicAction:
+#     def __init__(self, info):
+#         # info is a contingent-grounding action dict (see up_cpor.grounding).
+#         self.name = info["name"]
+#         self.observe = info["observe"]
+#         self.is_sensing = info["is_sensing"]
+#         # Positive dynamic preconditions the planner checks for applicability.
+#         self.preconditions = {f for f, pol in info["pre"] if pol}
+#         self.add_effects = set(info["add"])
+#         self.del_effects = set(info["del"])
+
+#     def is_applicable(self, state_fact_names):
+#         return self.preconditions.issubset(state_fact_names)
+
+#     def apply(self, current_facts_set):
+#         new_facts = set(current_facts_set)
+#         for f in self.add_effects:
+#             new_facts.add(f)
+#             new_facts.discard(f"NOT_{f}")
+#         for f in self.del_effects:
+#             new_facts.discard(f)
+#             new_facts.add(f"NOT_{f}")
+#         return new_facts
 
 class DynamicAction:
     def __init__(self, info):
-        # info is a contingent-grounding action dict (see up_cpor.grounding).
         self.name = info["name"]
         self.observe = info["observe"]
         self.is_sensing = info["is_sensing"]
-        # Positive dynamic preconditions the planner checks for applicability.
         self.preconditions = {f for f, pol in info["pre"] if pol}
         self.add_effects = set(info["add"])
         self.del_effects = set(info["del"])
+        self.cond_effects = info.get("cond", [])   # [(cond_lits, fluent, is_add)]
 
     def is_applicable(self, state_fact_names):
         return self.preconditions.issubset(state_fact_names)
 
-    def apply(self, current_facts_set):
-        new_facts = set(current_facts_set)
-        for f in self.add_effects:
-            new_facts.add(f)
-            new_facts.discard(f"NOT_{f}")
-        for f in self.del_effects:
-            new_facts.discard(f)
-            new_facts.add(f"NOT_{f}")
+    def effect_on(self, fact, pre_state):
+        if fact in self.add_effects: return True
+        if fact in self.del_effects: return False
+        for cond_lits, fluent, is_add in self.cond_effects:
+            if fluent == fact and all((g in pre_state) == pol for g, pol in cond_lits):
+                return is_add
+        return None
+
+    def apply(self, pre_state):
+        new_facts = set(pre_state)
+        new_facts |= self.add_effects
+        new_facts -= self.del_effects
+        for cond_lits, fluent, is_add in self.cond_effects:
+            if all((g in pre_state) == pol for g, pol in cond_lits):
+                if is_add: new_facts.add(fluent)
+                else: new_facts.discard(fluent)
         return new_facts
 
 class RegressionBelief:
-    """Regression-based belief for interleaved sensing and acting.
+    """Exact explicit-world belief tracker.
+    Tracks the exact set of possible worlds to fully support conditional effects
+    over uncertain variables without losing information."""
 
-    The hidden world is reasoned about at the INITIAL layer, where the oneof/or
-    constraints are valid. ``initial_known`` is the set of initial-state literals
-    the agent knows (closed under the constraints via Z3). ``history`` is the
-    sequence of deterministic actions executed so far. A query about the CURRENT
-    world is answered by regressing it back through ``history`` to an initial-state
-    condition and checking that against ``initial_known``; the current known-true
-    facts are obtained by progressing the known initial facts forward. This keeps
-    all constraint reasoning at the (sound) initial layer instead of applying
-    initial-state constraints to facts that actions have already changed.
-    """
-
-    def __init__(self, sat_solver, initial_known, history=(), plan=()):
+    def __init__(self, sat_solver, worlds, history=(), plan=()):
         self.sat = sat_solver
-        self.initial_known = frozenset(initial_known)
+        self.worlds = frozenset(frozenset(w) for w in worlds)
         self.history = tuple(history)
-        # Committed remaining classical-plan action names (FF's plan tail). The
-        # agent follows this rather than replanning every step, which prevents
-        # oscillation (moving a block out then back).
         self.plan = tuple(plan)
 
     def current_true_facts(self):
-        """Facts known to be true NOW: progress the known-true initial facts
-        forward through the deterministic action history."""
-        state = set(f for f in self.initial_known if not f.startswith("NOT_"))
-        for act in self.history:
-            state -= act.del_effects
-            state |= act.add_effects
-        return state
+        """Returns the intersection of all possible worlds (facts known to be true in all)."""
+        if not self.worlds:
+            return frozenset()
+        return frozenset.intersection(*self.worlds)
 
     def regress(self, literal):
-        """Regress a current-step literal back to an initial-state condition.
-        Returns True (guaranteed by an action), False (impossible), or the
-        initial-state literal that must hold."""
-        neg = literal.startswith("NOT_")
-        base = literal[4:] if neg else literal
-        for act in reversed(self.history):
-            if base in act.add_effects:
-                return (not neg)   # base set true by this action
-            if base in act.del_effects:
-                return neg         # base set false by this action
-        return literal             # untouched: depends on the initial value
+        pass # Kept for API compatibility, logic explicitly handled now
 
     def known_value(self, base):
-        """Current truth value of a positive fluent: True / False / None(unknown)."""
-        r = self.regress(base)
-        if r is True or r is False:
-            return r
-        if base in self.initial_known:
-            return True
-        if ("NOT_" + base) in self.initial_known:
-            return False
+        """Current truth value: True if in all worlds, False if in none, else None."""
+        is_true = all(base in w for w in self.worlds)
+        is_false = all(base not in w for w in self.worlds)
+        if is_true: return True
+        if is_false: return False
         return None
 
     def progress(self, action):
-        """Belief after executing a deterministic action (extends history); the
-        committed plan advances past the action if it was its head."""
         new_plan = self.plan[1:] if (self.plan and self.plan[0] == action.name) else self.plan
-        return RegressionBelief(self.sat, self.initial_known, self.history + (action,), new_plan)
+        new_worlds = [action.apply(w) for w in self.worlds]
+        return RegressionBelief(self.sat, new_worlds, self.history + (action,), new_plan)
 
     def observe(self, literal):
-        """Belief after observing ``literal`` to hold at the current step. Returns
-        None if that observation is logically impossible (a dead-end branch)."""
-        init_cond = self.regress(literal)
-        if init_cond is True:
-            return self            # already guaranteed; consistent, no new info
-        if init_cond is False:
-            return None            # impossible observation
-        new_known = set(self.initial_known)
-        new_known.add(init_cond)
-        closure = self.sat.propagate(list(new_known))   # Z3 closure over INITIAL literals (sound)
-        if closure is None:
-            return None            # inconsistent with the constraints -> dead end
-        # Keep the committed plan across sensing (it is re-validated before use).
-        return RegressionBelief(self.sat, closure, self.history, self.plan)
+        neg = literal.startswith("NOT_")
+        base = literal[4:] if neg else literal
+        new_worlds = []
+        for w in self.worlds:
+            if (base in w) if not neg else (base not in w):
+                new_worlds.append(w)
+        if not new_worlds:
+            return None
+        return RegressionBelief(self.sat, new_worlds, self.history, self.plan)
 
     def with_plan(self, plan):
-        return RegressionBelief(self.sat, self.initial_known, self.history, plan)
+        return RegressionBelief(self.sat, self.worlds, self.history, plan)
 
     def signature(self):
-        # (known initial state, current world state, committed plan) -- determines
-        # future planning and gives cycle detection.
-        return (self.initial_known, frozenset(self.current_true_facts()), self.plan)
-
+        return (self.worlds, self.plan)
 
 class NativeSDRImpl:
     def __init__(self, problem, problem_file=None, error_on_failed_checks=False):
@@ -274,6 +276,25 @@ class NativeSDRImpl:
             if act.is_sensing and act.observe:
                 self.sensing_map[act.observe] = name
 
+        # Derive hidden-fact correlations from conditional effects whose condition
+        # references an already-hidden fact (e.g. localize5's `free-up` is correlated
+        # with `at` via checking's when-clauses, but never declared in :init).
+        def _neg(lit_pair):
+            g, pol = lit_pair
+            return ("NOT_" + g) if pol else g
+
+        for info in self.kt_action_info:
+            for cond_lits, fluent, is_add in info.get("cond", []):
+                if fluent in self.sat_solver.oneof_members:
+                    continue  # state-transition effect on a tracked variable, not a new hidden fact
+                hidden_lits = [(g, pol) for g, pol in cond_lits
+                               if g in self.sat_solver.unknown_facts]
+                if not hidden_lits:
+                    continue
+                target = fluent if is_add else ("NOT_" + fluent)
+                clause = [_neg(lit) for lit in hidden_lits] + [target]
+                self.sat_solver.add_hidden_clause(fluent, clause)
+
         # Goals and the fluent->FNode map come from the (ungrounded) problem: goals
         # are already ground and initial_values enumerates every ground fluent.
         self.converter = ASTConverter()
@@ -301,11 +322,20 @@ class NativeSDRImpl:
         hidden_preds = {hf.fluent().name for hf in getattr(problem, "hidden_fluents", [])
                         if not hf.is_not()}
         sensed_preds, precond_preds = set(), set()
+        # for a in problem.actions:
+        #     for obs in (getattr(a, "observed_fluents", []) or []):
+        #         sensed_preds.add(obs.fluent().name)
+        #     for pre in a.preconditions:
+        #         _collect_pred_names(pre, precond_preds)
+        # self.needs_kt = bool((precond_preds & hidden_preds) - sensed_preds)
         for a in problem.actions:
             for obs in (getattr(a, "observed_fluents", []) or []):
                 sensed_preds.add(obs.fluent().name)
             for pre in a.preconditions:
                 _collect_pred_names(pre, precond_preds)
+            for e in getattr(a, "effects", []) or []:
+                if not e.condition.is_true():
+                    _collect_pred_names(e.condition, precond_preds)
         self.needs_kt = bool((precond_preds & hidden_preds) - sensed_preds)
 
         self._grounded_action_map = None  # built lazily via the UP grounder
@@ -346,24 +376,19 @@ class NativeSDRImpl:
                 or (None, belief)
 
         # 2b. Fallback: consistent world (Z3 model) progressed through history.
-        model = self.sat_solver.complete(belief.initial_known)
-        if model is None:
-            return None, belief
-        full_state = set(model) | {f for f in belief.initial_known if not f.startswith("NOT_")}
-        for act in belief.history:
-            full_state -= act.del_effects
-            full_state |= act.add_effects
+        full_state = list(belief.worlds)[0] if belief.worlds else frozenset()
         plan = self._ff_plan_cached(frozenset(full_state))
         if not plan:
-            optimistic = set(current_facts)
+            optimistic = set(belief.current_true_facts())
             for f in self.sat_solver.unknown_facts:
                 if belief.known_value(f) is None:
                     optimistic.add(f)
             plan = self._ff_plan_cached(frozenset(optimistic))
 
         if plan:
-            return self._follow_committed_plan(belief.with_plan(tuple(plan)), current_facts) \
-                or (None, belief)
+            chosen = self._follow_committed_plan(belief.with_plan(tuple(plan)), current_facts)
+            if chosen is not None:
+                return chosen
 
         # 3. Nothing usable: explore by sensing a currently-unknown fluent that is
         #    directly applicable now.
@@ -391,13 +416,11 @@ class NativeSDRImpl:
         classical path toward an unknown sensing action's preconditions, commit it,
         and follow it (the sensing action itself is appended so it fires on arrival).
         Returns (action, belief) or None if nothing can be set up to observe."""
-        model = self.sat_solver.complete(belief.initial_known)
-        if model is None:
+        
+        # New Explicit World Tracking logic: just pick a valid progressed world
+        if not belief.worlds:
             return None
-        full_state = set(model) | {f for f in belief.initial_known if not f.startswith("NOT_")}
-        for act in belief.history:
-            full_state -= act.del_effects
-            full_state |= act.add_effects
+        full_state = list(belief.worlds)[0]
 
         for name in sorted(self.dynamic_actions):
             act = self.dynamic_actions[name]
@@ -428,35 +451,17 @@ class NativeSDRImpl:
     KT_MAX_TAGS = 300       # max distinct tags handed to FF (tractability of the KT domain)
 
     def _kt_determinize(self, belief):
-        """SDR determinization via the KT (knowledge) translation. Returns a
-        committed plan of canonical (real + sensing) action names, or [] to defer
-        to the fallback determinizer."""
-        init_models = self.sat_solver.enumerate_models(list(belief.initial_known),
-                                                       self.MODEL_ENUM_CAP + 1)
-        # Defer to the fallback when there are no worlds, or when there are more
-        # possible worlds than we can enumerate -- a partial enumeration would make
-        # the KT merge actions unsound (they could conclude knowledge an unseen
-        # world contradicts).
-        if not init_models or len(init_models) > self.MODEL_ENUM_CAP:
+        worlds = list(belief.worlds)
+        if not worlds or len(worlds) > self.MODEL_ENUM_CAP:
             return []
-
-        known_pos = {f for f in belief.initial_known if not f.startswith("NOT_")}
-        worlds = []
-        for model in init_models:
-            state = set(known_pos) | set(model)
-            for act in belief.history:
-                state -= act.del_effects
-                state |= act.add_effects
-            worlds.append(state)
 
         union = set().union(*worlds)
         uncertain = {f for f in union if any(f in w for w in worlds) and any(f not in w for w in worlds)}
 
         if not uncertain:
-            # Belief fully determined -> a plain classical plan suffices.
             return self._run_cpp_ff_plan(worlds[0])
 
-        known_true = set(worlds[0]).intersection(*worlds[1:]) if len(worlds) > 1 else set(worlds[0])
+        known_true = set.intersection(*[set(w) for w in worlds])
         seen, tags = set(), []
         for w in worlds:
             t = frozenset(w & uncertain)
@@ -464,26 +469,23 @@ class NativeSDRImpl:
                 seen.add(t)
                 tags.append(t)
 
-        # Too many distinct tags -> the KT-translated FF domain would be too large;
-        # defer to the (cheaper, single-world) fallback determinizer.
         if len(tags) > self.KT_MAX_TAGS:
             return []
 
-        actions_arg = [(a["name"], a["is_sensing"], a["observe"], a["pre"], a["add"], a["del"])
+        actions_arg = [(a["name"], a["is_sensing"], a["observe"], a["pre"], a["add"], a["del"], a.get("cond", []))
                        for a in self.kt_action_info]
         domain, problem = cpor_engine.kt_translate(
             actions_arg, sorted(uncertain), [list(t) for t in tags],
             sorted(known_true), self.goal_literals)
+        
         raw = self._ff_solve_pddl(domain, problem)
 
         plan = []
         for step in raw:
             tok = step.lower().strip().split()
-            if not tok:
-                continue
+            if not tok: continue
             name = tok[0]
-            if name.startswith("merge_") or name.startswith("ref_"):
-                continue  # internal inference actions, not executed
+            if name.startswith("merge_") or name.startswith("ref_"): continue
             if name in self.dynamic_actions:
                 plan.append(name)
             elif name in self.normalized_action_map:
@@ -556,7 +558,9 @@ class NativeSDRImpl:
         the full contingent-grounded actions (sensing actions are dropped). Returns
         the plan as canonical grounded action names. ``goal`` overrides the problem
         goal (used by plan-to-observe to plan toward a sensing precondition)."""
-        actions_arg = [(a["name"], a["is_sensing"], a["observe"], a["pre"], a["add"], a["del"])
+        # actions_arg = [(a["name"], a["is_sensing"], a["observe"], a["pre"], a["add"], a["del"])
+        #                for a in self.kt_action_info]
+        actions_arg = [(a["name"], a["is_sensing"], a["observe"], a["pre"], a["add"], a["del"], a.get("cond", []))
                        for a in self.kt_action_info]
         domain, problem = cpor_engine.kt_translate(
             actions_arg, [], [], sorted(facts), self.goal_literals if goal is None else goal)
@@ -581,11 +585,18 @@ class CPORMetaPlanner:
         self.visited_beliefs = {}
 
     def make_initial_belief(self, initial_true_facts):
-        """Build the root RegressionBelief from the known-true initial facts,
-        closed under the oneof/or constraints (sound: nothing has acted yet)."""
-        closure = self.online_planner.sat_solver.propagate(list(initial_true_facts))
-        known = set(closure) if closure is not None else set(initial_true_facts)
-        return RegressionBelief(self.online_planner.sat_solver, known)
+        """Build the root Belief by enumerating all valid initial models ONCE."""
+        known_pos = {f for f in initial_true_facts if not f.startswith("NOT_")}
+        models = self.online_planner.sat_solver.enumerate_models(list(initial_true_facts), 4000)
+        
+        worlds = []
+        for m in models:
+            worlds.append(known_pos | set(m))
+            
+        if not worlds:
+            worlds = [known_pos]
+            
+        return RegressionBelief(self.online_planner.sat_solver, worlds)
 
     def build_plan_graph(self, belief):
         # Regression-based: reasoning happens at the initial layer (see
