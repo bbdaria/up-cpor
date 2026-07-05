@@ -17,6 +17,7 @@ add_library(cpor_core STATIC
     src/LogicalUtilities/AndNode.cpp
     src/LogicalUtilities/OrNode.cpp
     src/PlanningModel/KTTranslator.cpp # KT (knowledge) translation
+    src/PlanningModel/PlanGraphEquivalence.cpp # belief-equivalence compaction + cycle detection
 )
 target_include_directories(cpor_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
@@ -112,7 +113,10 @@ if(BUILD_CPP_TESTS)
     FetchContent_MakeAvailable(Catch2)
 
     # Point Catch2 to your C++ test file
-    add_executable(run_tests tests/cpp/test_logical_utils.cpp)
+    add_executable(run_tests
+        tests/cpp/test_logical_utils.cpp
+        tests/cpp/test_plan_graph_equivalence.cpp
+    )
     target_link_libraries(run_tests PRIVATE
     cpor_core Catch2::Catch2WithMain)
 endif()

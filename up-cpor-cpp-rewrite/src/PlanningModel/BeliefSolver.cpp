@@ -89,6 +89,12 @@ std::optional<std::vector<std::string>> BeliefSolver::complete(const std::vector
     return true_facts;
 }
 
+bool BeliefSolver::implies(const std::vector<std::string>& base_facts, const std::string& literal) {
+    z3::expr_vector assumptions = assumptions_for(base_facts);
+    assumptions.push_back(!literal_expr(literal));
+    return solver_.check(assumptions) == z3::unsat;
+}
+
 std::optional<std::set<std::string>> BeliefSolver::propagate(const std::vector<std::string>& facts) {
     std::set<std::string> closure(facts.begin(), facts.end());
 
