@@ -1,9 +1,80 @@
 import itertools
+import logging
 
 import cpor_engine
 from unified_planning.shortcuts import get_environment
 from up_cpor.converter import ASTConverter
 from up_cpor.grounding import ground_actions
+
+# ---------------------------------------------------------------------------
+# Decision trace: a human-readable log of every choice the planner makes
+# (node expansions, merges, plan commits, FF calls, observation branches,
+# dead-end causes), meant for post-mortem debugging of a failed/odd plan
+# graph. Enable by constructing CPORMetaPlanner(..., trace_path="run.log")
+# or calling enable_trace("run.log") directly. Disabled it costs one
+# isEnabledFor() check per site.
+# ---------------------------------------------------------------------------
+_TRACE = logging.getLogger("up_cpor.trace")
+_TRACE.addHandler(logging.NullHandler())
+_TRACE.propagate = False
+
+
+def enable_trace(path=None):
+    """Log every planner decision to `path` (or stderr when None)."""
+    handler = logging.FileHandler(path, mode="w") if path else logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    for h in list(_TRACE.handlers):
+        if not isinstance(h, logging.NullHandler):
+            _TRACE.removeHandler(h)
+    _TRACE.addHandler(handler)
+    _TRACE.setLevel(logging.DEBUG)
+
+
+def plan_graph_stats(root):
+    """DAG-aware verdict on a built plan graph.
+
+    A contingent plan is VALID exactly when it has at least one GOAL leaf and
+    no DEAD END leaf: every DEAD END sits on an observation branch that CAN
+    occur in some possible world, so some execution fails to reach the goal
+    (the problem is unsolvable, or the planner failed on that contingency --
+    the decision trace, see enable_trace, tells which). UNREACHABLE leaves
+    mark observation outcomes that contradict the belief and can never occur;
+    they do not invalidate the plan."""
+    seen, counts = set(), {"nodes": 0, "goal_leaves": 0, "dead_end_leaves": 0,
+                           "unreachable_leaves": 0}
+
+    def walk(node):
+        if node is None or id(node) in seen:
+            return
+        seen.add(id(node))
+        counts["nodes"] += 1
+        if not node["children"]:
+            if node["action"] == "GOAL REACHED":
+                counts["goal_leaves"] += 1
+            elif node["action"].startswith("UNREACHABLE"):
+                counts["unreachable_leaves"] += 1
+            else:
+                counts["dead_end_leaves"] += 1
+        for _label, child in node["children"]:
+            walk(child)
+
+    walk(root)
+    counts["solved"] = counts["goal_leaves"] > 0 and counts["dead_end_leaves"] == 0
+    return counts
+
+
+def _belief_brief(belief):
+    """One-line belief summary for trace lines."""
+    plan = getattr(belief, "plan", ())
+    head = " plan[{}]->{}".format(len(plan), plan[0]) if plan else " plan=[]"
+    observed = getattr(belief, "observed", None)
+    if observed is not None:  # LazyBelief
+        return "facts={}{} observed=[{}]".format(
+            len(belief.facts), head, ",".join(sorted(observed)))
+    worlds = getattr(belief, "worlds", None)
+    return "worlds={} hist={}{}".format(
+        len(worlds) if worlds is not None else "?",
+        len(getattr(belief, "history", ())), head)
 
 def extract_and_map_fluents(node, target_set, fnode_map=None):
     if node.is_fluent_exp():
@@ -637,6 +708,12 @@ class NativeSDRImpl:
         preds = [cpor_engine.Predicate(f) for f in current_facts]
         return self.compiled_goal.is_true(preds)
 
+    def _t(self, msg, *args):
+        # Decision-trace line (see enable_trace at module top); the "*" marks
+        # online-planner strategy steps under the meta-planner's EXPAND lines.
+        if _TRACE.isEnabledFor(logging.DEBUG):
+            _TRACE.debug("      * %s", msg.format(*args) if args else msg)
+
     def get_next_action(self, belief, retry=0):
         """Return (action, belief) where belief may carry a freshly-committed plan.
         Returns (None, belief) at the goal or a genuine dead end.
@@ -661,10 +738,12 @@ class NativeSDRImpl:
                 if (act.is_sensing and act.observe in self.sat_solver.unknown_facts
                         and belief.known_value(act.observe) is None
                         and act.preconditions <= current_facts):
+                    self._t("loop-escape (a): sense {} to change the belief", act.observe)
                     return act, belief
             # (b) plan toward an unknown sensing action's preconditions
             chosen = self._plan_to_observe(belief, current_facts)
             if chosen is not None:
+                self._t("loop-escape (b): plan-to-observe -> {}", chosen[0].name)
                 return chosen
             # (c) replan from an alternative world sample (a different Z3
             #     model than the one the looping plan was derived from);
@@ -673,22 +752,27 @@ class NativeSDRImpl:
             worlds = sorted(itertools.islice(candidates, 32), key=sorted)
             if worlds:
                 sample = worlds[retry % len(worlds)]
+                self._t("loop-escape (c): replan from alternative world sample {}/{}",
+                        retry % len(worlds), len(worlds))
                 plan = self._ff_plan_cached(frozenset(sample))
                 if plan:
                     chosen = self._follow_committed_plan(belief.with_plan(tuple(plan)), current_facts)
                     if chosen is not None:
                         return chosen
+            self._t("loop-escape: all strategies exhausted at retry {}", retry)
             return None, belief
 
         # 1. Follow the committed plan if there is one and it is still valid.
         chosen = self._follow_committed_plan(belief, current_facts)
         if chosen is not None:
+            self._t("following committed plan -> {}", chosen[0].name)
             return chosen
 
         # 2. Determinize via the KT (knowledge) translation -- only for domains
         #    that need deduced (not directly sensed) hidden preconditions.
         plan, expect = self._kt_determinize(belief) if self.needs_kt else ([], None)
         if plan:
+            self._t("KT (knowledge translation) plan committed: {}", list(plan))
             return self._follow_committed_plan(belief.with_plan(tuple(plan), expect), current_facts) \
                 or (None, belief)
 
@@ -701,8 +785,13 @@ class NativeSDRImpl:
         #     above would have ended the node.
         full_state = next((w for w in belief.sample_worlds() if not self.is_goal_facts(w)),
                           frozenset())
+        if _TRACE.isEnabledFor(logging.DEBUG):
+            hidden_part = sorted(f for f in full_state if f in self.sat_solver.unknown_facts)
+            self._t("sampled goal-violating world (hidden part: {})", hidden_part)
         plan = self._ff_plan_cached(frozenset(full_state))
         if not plan:
+            self._t("no FF plan from the sampled world; trying the optimistic "
+                    "(all-unknowns-true) state")
             optimistic = set(belief.current_true_facts())
             for f in self.sat_solver.unknown_facts:
                 if belief.known_value(f) is None:
@@ -714,9 +803,12 @@ class NativeSDRImpl:
                 plan = self._ff_plan_cached(frozenset(optimistic))
 
         if plan:
+            self._t("classical plan committed: {}", list(plan))
             chosen = self._follow_committed_plan(belief.with_plan(tuple(plan)), current_facts)
             if chosen is not None:
                 return chosen
+            self._t("committed plan not followable from here (see lines above); "
+                    "falling through")
 
         # 2c. Sec 5.7 support: a non-deterministic action carries no add/del
         #     effects FF can exploit (its outcomes are chosen by the
@@ -726,6 +818,7 @@ class NativeSDRImpl:
         for name in sorted(self.dynamic_actions):
             act = self.dynamic_actions[name]
             if act.is_nondet and act.preconditions <= current_facts:
+                self._t("taking applicable non-deterministic action {}", name)
                 return act, belief
 
         # 3. Nothing usable: explore by sensing a currently-unknown fluent that is
@@ -735,6 +828,7 @@ class NativeSDRImpl:
             if (act.is_sensing and act.observe in self.sat_solver.unknown_facts
                     and belief.known_value(act.observe) is None
                     and act.preconditions <= current_facts):
+                self._t("no goal plan; exploring by sensing {} (applicable now)", act.observe)
                 return act, belief
 
         # 4. Plan-to-observe: no sensing action is applicable right now and the
@@ -745,8 +839,11 @@ class NativeSDRImpl:
         #    PlanToObserveDeadEnd step.
         chosen = self._plan_to_observe(belief, current_facts)
         if chosen is not None:
+            self._t("plan-to-observe -> {}", chosen[0].name)
             return chosen
 
+        self._t("EXHAUSTED: no committed plan, no classical/KT plan from any "
+                "consistent world, nothing left to sense or plan toward")
         return None, belief
 
     def _plan_to_observe(self, belief, current_facts):
@@ -819,8 +916,12 @@ class NativeSDRImpl:
         domain, problem = cpor_engine.kt_translate(
             actions_arg, sorted(uncertain), [list(t) for t in tags],
             sorted(known_true), self.goal_literals)
-        
+
         raw = self._ff_solve_pddl(domain, problem)
+        if _TRACE.isEnabledFor(logging.DEBUG):
+            self._t("KT FF call ({} uncertain fluents, {} tags) -> {}",
+                    len(uncertain), len(tags),
+                    "plan of {} steps".format(len(raw)) if raw else "NO PLAN")
 
         plan = []
         for step in raw:
@@ -880,7 +981,12 @@ class NativeSDRImpl:
                 # assumed outcome is contradicted, in which case the suffix
                 # is invalid and the caller must replan.
                 if belief.expect[0] is not None and kv != belief.expect[0]:
+                    self._t("plan step {} senses {} but its value ({}) contradicts "
+                            "the plan's assumption -> plan invalid, replan",
+                            head, act.observe, kv)
                     return None
+                self._t("plan step {} senses {} whose value is already known ({}) "
+                        "-> skipping the no-op step", head, act.observe, kv)
                 return self._follow_committed_plan(
                     belief.with_plan(plan[1:], belief.expect[1:]), current_facts)
 
@@ -893,6 +999,8 @@ class NativeSDRImpl:
         for missing_fact in sorted(missing):
             value = belief.known_value(missing_fact)
             if value is False and missing_fact in self.sat_solver.unknown_facts:
+                self._t("plan step {} needs {} which is known FALSE -> plan "
+                        "invalid, replan", head, missing_fact)
                 return None  # real world contradicts the committed plan -> replan
             if value is None:
                 # Inject a sensor for the unknown precondition -- but only one
@@ -903,6 +1011,8 @@ class NativeSDRImpl:
                 for sense_name in self.sensing_map.get(missing_fact, ()):
                     sense_act = self.dynamic_actions[sense_name]
                     if sense_act.preconditions <= current_facts:
+                        self._t("plan step {} needs unknown {} -> injecting "
+                                "sensing action {}", head, missing_fact, sense_name)
                         return sense_act, belief
                 if missing_fact in self.sat_solver.unknown_facts:
                     # Not directly sensable -- either nowhere (wumpus `safe`,
@@ -920,7 +1030,11 @@ class NativeSDRImpl:
                         and belief.known_value(sense_act.observe) is None
                         and sense_act.observe in self.sat_solver.unknown_facts
                         and sense_act.preconditions <= current_facts):
+                    self._t("plan step {} blocked on a non-sensable unknown -> "
+                            "gathering information by sensing {}", head, sense_act.observe)
                     return sense_act, belief
+            self._t("plan step {} blocked on a non-sensable unknown and nothing "
+                    "is sensable here -> replan", head)
             return None  # nothing left to sense -> cannot establish it -> replan
 
         # Remaining "missing" facts are static/non-sensable (e.g. same-block
@@ -940,6 +1054,10 @@ class NativeSDRImpl:
         domain, problem = cpor_engine.kt_translate(
             actions_arg, [], [], sorted(facts), self.goal_literals if goal is None else goal)
         raw = self._ff_solve_pddl(domain, problem)
+        if _TRACE.isEnabledFor(logging.DEBUG):
+            self._t("FF call ({}) -> {}",
+                    "goal override: " + str(goal) if goal is not None else "problem goal",
+                    "plan of {} steps".format(len(raw)) if raw else "NO PLAN")
         plan = []
         for step in raw:
             tok = step.lower().strip().split()
@@ -968,7 +1086,11 @@ class CPORMetaPlanner:
     # the reusable chain-entrance nodes).
     MAX_OBS_SETS_PER_LITERAL = 40
 
-    def __init__(self, simulator, online_planner):
+    def __init__(self, simulator, online_planner, trace_path=None):
+        # trace_path: write the decision trace (see enable_trace) to this
+        # file; None leaves tracing off.
+        if trace_path:
+            enable_trace(trace_path)
         self.online_planner = online_planner
         self.visited_beliefs = {}
 
@@ -1010,6 +1132,15 @@ class CPORMetaPlanner:
         # get_next_action(retry=count), which mutates the strategy. Bounded by
         # MAX_LOOP_RETRIES, then the branch is an honest DEAD END.
         self._open_sigs = {}
+
+        # Decision-trace bookkeeping (see enable_trace at module top).
+        self._trace_depth = 0
+        self._trace_next_id = 0
+
+    def _t(self, msg, *args):
+        if _TRACE.isEnabledFor(logging.DEBUG):
+            _TRACE.debug("%s%s", "  " * min(self._trace_depth, 24),
+                         msg.format(*args) if args else msg)
 
     def make_initial_belief(self, initial_true_facts):
         """Build the root Belief: SAT-backed (no enumeration) for eligible
@@ -1155,21 +1286,29 @@ class CPORMetaPlanner:
         # exception, not the rule, in non-deterministic domains, so this is
         # the mechanism actually doing the cycle-avoidance work here, not a
         # backstop for the exact memo.
+        self._t("EXPAND n{} | {}", self._trace_next_id, _belief_brief(belief))
+        self._trace_next_id += 1
+
         if self.cycle_detection_enabled:
             ancestor_depth = self.cycle_guard.find_ancestor_match(sorted(current_facts))
             if ancestor_depth is not None and (via_observation or self.cycle_guard.safe_cycle(ancestor_depth)):
                 node = self._ancestor_nodes[ancestor_depth]
                 self.visited_beliefs[belief.signature()] = node
+                self._t("-> CYCLE: state matches open ancestor at depth {}; reusing its node ({})",
+                        ancestor_depth, node["action"])
                 return node
 
         bs_hash = belief.signature()
         open_count = self._open_sigs.get(bs_hash, 0)
         if bs_hash in self.visited_beliefs and open_count == 0:
-            return self.visited_beliefs[bs_hash]
+            node = self.visited_beliefs[bs_hash]
+            self._t("-> MEMO: exact belief signature already planned ({})", node["action"])
+            return node
 
         if self.online_planner.is_goal_facts(current_facts):
             node = {"action": "GOAL REACHED", "children": []}
             self.visited_beliefs[bs_hash] = node
+            self._t("-> GOAL REACHED")
             if self.compaction_enabled:
                 known, _hidden = self._known_and_hidden(belief)
                 self._register_closed_node(node, self._goal_closed_info(known))
@@ -1180,14 +1319,27 @@ class CPORMetaPlanner:
         if equivalent_id is not None:
             node = self._closed_node_graph[equivalent_id]
             self.visited_beliefs[bs_hash] = node
+            self._t("-> MERGE: belief-equivalent closed node #{} ({}); reusing its subtree",
+                    equivalent_id, node["action"])
             return node
 
         if open_count >= self.MAX_LOOP_RETRIES:
+            self._t("-> DEAD END: belief re-entered {}x on the current path and every "
+                    "loop-escape strategy was exhausted | known={} hidden={}",
+                    open_count, sorted(known), sorted(hidden))
             return {"action": "DEAD END", "children": []}
 
+        if open_count:
+            self._t("LOOP-ESCAPE retry {} of {}: belief already open on this path",
+                    open_count, self.MAX_LOOP_RETRIES)
         action, belief = self.online_planner.get_next_action(belief, retry=open_count)
         if action is None:
+            self._t("-> DEAD END: no applicable strategy produced an action | "
+                    "known={} hidden={}", sorted(known), sorted(hidden))
             return {"action": "DEAD END", "children": []}
+        self._t("ACTION {}{}", action.name,
+                " (sensing {})".format(action.observe) if action.is_sensing else
+                (" (non-deterministic)" if getattr(action, "is_nondet", False) else ""))
 
         node = {"action": action.name, "children": []}
         if open_count == 0:
@@ -1201,6 +1353,7 @@ class CPORMetaPlanner:
             self._ancestor_nodes.append(node)
 
         self._open_sigs[bs_hash] = open_count + 1
+        self._trace_depth += 1
         try:
             if action.is_sensing:
                 obs = action.observe
@@ -1221,9 +1374,19 @@ class CPORMetaPlanner:
                 child_info = {}
                 for value, label, key in ((obs, f"Observed: {obs} == True", True),
                                            (f"NOT_{obs}", f"Observed: {obs} == False", False)):
+                    self._t("BRANCH {} == {}{}", obs, key,
+                            " (plan suffix kept)" if in_plan and expected is not None
+                            and key == expected else "")
                     next_belief = belief.observe(value)
                     if next_belief is None:
-                        child = {"action": "DEAD END", "children": []}
+                        # This outcome contradicts the belief -- the branch can
+                        # never be taken at execution time. Distinct label from
+                        # DEAD END: an UNREACHABLE leaf never invalidates the
+                        # plan, a (reachable) DEAD END leaf always does.
+                        child = {"action": "UNREACHABLE (impossible observation)",
+                                 "children": []}
+                        self._t("-> outcome impossible (contradicts current knowledge): "
+                                "unreachable branch, not a failure")
                     else:
                         if in_plan:
                             if expected is not None and key == expected:
@@ -1246,6 +1409,7 @@ class CPORMetaPlanner:
                 # Sec 5.4 compaction here -- that mechanism is restricted to
                 # simple (deterministic) domains.
                 for idx in range(len(action.nondet_outcomes)):
+                    self._t("BRANCH non-deterministic outcome {}", idx)
                     next_belief = belief.progress_nondet(action, idx).with_plan(())
                     child = self.build_plan_graph(next_belief, via_observation=True)
                     node["children"].append((f"Outcome {idx}", child))
@@ -1262,6 +1426,7 @@ class CPORMetaPlanner:
                             child_info, list(action.preconditions), effects)
                         self._register_closed_node(node, info)
         finally:
+            self._trace_depth -= 1
             if open_count == 0:
                 self._open_sigs.pop(bs_hash, None)
             else:

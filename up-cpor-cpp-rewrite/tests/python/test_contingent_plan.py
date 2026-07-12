@@ -71,7 +71,7 @@ def _run_from_rewrite_root(monkeypatch):
     monkeypatch.chdir(_REWRITE_ROOT)
 
 
-@pytest.mark.parametrize("domain", ["blocks2", "blocks3", "blocks7", "doors5", "colorballs2-2", "localize5", "doors15"])
+@pytest.mark.parametrize("domain", ["blocks2", "blocks3", "blocks7", "doors5", "colorballs2-2", "localize5", "doors15", "unix1"])
 def test_all_branches_reach_goal(domain):
     plan = _build_plan(domain)
     leaves = []

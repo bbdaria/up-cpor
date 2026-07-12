@@ -1,7 +1,8 @@
+import argparse
 import os
 import cpor_engine
 from unified_planning.io import PDDLReader
-from up_cpor.native_engine import NativeSDRImpl as SDRImpl, CPORMetaPlanner
+from up_cpor.native_engine import NativeSDRImpl as SDRImpl, CPORMetaPlanner, plan_graph_stats
 
 def convert_up_state_to_cpp(up_state):
     cpp_state = []
@@ -109,31 +110,60 @@ def print_plan_tree(node, depth=0, path=None):
         print_plan_tree(child, depth + 2, path | {id(node)})
 
 def main():
-    print("--- CPOR Hybrid Engine Initialization ---")
-    domain_file = "../tests/blocks7/d.pddl"
-    problem_file = "../tests/blocks7/p.pddl"
+    parser = argparse.ArgumentParser(
+        description="Build a contingent plan graph for a (contingent) PDDL problem.")
+    parser.add_argument("domain", nargs="?", default="../tests/blocks2/d.pddl",
+                        help="domain PDDL file (default: ../tests/blocks2/d.pddl)")
+    parser.add_argument("problem", nargs="?", default="../tests/blocks2/p.pddl",
+                        help="problem PDDL file (default: ../tests/blocks2/p.pddl)")
+    parser.add_argument("-log", nargs="?", const="cpor_trace.log", default=None,
+                        metavar="PATH", dest="log",
+                        help="write the planner decision trace to PATH "
+                             "(default when the flag is given: cpor_trace.log)")
+    parser.add_argument("-o", "--out", default="output.txt",
+                        help="output DOT graph file (default: output.txt)")
+    parser.add_argument("--tree", action="store_true",
+                        help="also print the plan tree to stdout (verbose on big graphs)")
+    args = parser.parse_args()
 
-    if not os.path.exists(domain_file):
-        return print("Error: Could not find PDDL files")
+    print("--- CPOR Hybrid Engine Initialization ---")
+    if not (os.path.exists(args.domain) and os.path.exists(args.problem)):
+        print(f"Error: Could not find PDDL files {args.domain} / {args.problem}")
+        return 2
 
     reader = PDDLReader()
-    problem = reader.parse_problem(domain_file, problem_file)
-    
+    problem = reader.parse_problem(args.domain, args.problem)
+
     cpp_initial_state = convert_up_state_to_cpp(problem.initial_values)
     initial_true = {p.get_name() for p in cpp_initial_state}
 
     print("\nInitializing Online Planner (SDR)...")
-    online_planner = SDRImpl(problem=problem, problem_file=problem_file)
-    meta_planner = CPORMetaPlanner(simulator=None, online_planner=online_planner)
+    online_planner = SDRImpl(problem=problem, problem_file=args.problem)
+    meta_planner = CPORMetaPlanner(simulator=None, online_planner=online_planner,
+                                   trace_path=args.log)
+    if args.log:
+        print(f"Decision trace -> {os.path.abspath(args.log)}")
 
     print("\n--- Generating Native C++ Contingent Plan Graph ---\n")
     plan_graph = meta_planner.build_plan_graph(meta_planner.make_initial_belief(initial_true))
-    
-    print_plan_tree(plan_graph)
 
-    dot_path = write_dot_graph(plan_graph, "output.txt")
-    print(f"\n📄 Wrote Graphviz DOT graph to {os.path.abspath(dot_path)}")
-    print("\n✅ Plan Graph Generation Complete!")
+    if args.tree:
+        print_plan_tree(plan_graph)
+
+    stats = plan_graph_stats(plan_graph)
+    dot_path = write_dot_graph(plan_graph, args.out)
+    print(f"Wrote Graphviz DOT graph to {os.path.abspath(dot_path)}")
+    print(f"{stats['nodes']} nodes | {stats['goal_leaves']} goal leaves | "
+          f"{stats['dead_end_leaves']} dead ends | "
+          f"{stats['unreachable_leaves']} unreachable branches")
+    if stats["solved"]:
+        print("\nPlan Graph Generation Complete: every reachable branch reaches the goal.")
+    else:
+        print("\nNO VALID CONTINGENT PLAN: some reachable branch dead-ends."
+              + (f" See the decision trace: {os.path.abspath(args.log)}"
+                 if args.log else " Re-run with -log to see why."))
+    return 0 if stats["solved"] else 1
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
