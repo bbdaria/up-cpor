@@ -1,3 +1,5 @@
+import itertools
+
 import cpor_engine
 from unified_planning.shortcuts import get_environment
 from up_cpor.converter import ASTConverter
@@ -63,10 +65,25 @@ class MiniSATSolver:
         self._solver = cpor_engine.BeliefSolver()
         self.unknown_facts = set()
 
+        self._closure_cache = {}
         oneof = list(getattr(problem, "oneof_constraints", []))
         self.oneof_members = {_literal_to_str(x) for group in oneof for x in group}
         or_constraints = list(getattr(problem, "or_constraints", []))
         hidden = getattr(problem, "hidden_fluents", [])
+
+        # Factored view of the constraints, used by the fast Python closure and
+        # canonical-world sampling below. Valid only while the constraint
+        # system is INDEPENDENT positive oneof groups (no or-clauses, no
+        # derived hidden clauses, no fluent in two groups) -- checked here and
+        # invalidated by add_hidden_clause().
+        self.oneof_groups = [[_literal_to_str(x) for x in group] for group in oneof]
+        seen_bases = set()
+        self.factored = not or_constraints
+        for group in self.oneof_groups:
+            for lit in group:
+                if lit.startswith("NOT_") or lit in seen_bases:
+                    self.factored = False
+                seen_bases.add(lit)
 
         for group in oneof:
             self._solver.add_oneof([_literal_to_str(x) for x in group])
@@ -120,9 +137,59 @@ class MiniSATSolver:
 
     def propagate(self, current_facts):
         """Return the logical closure of current_facts under the constraints, or
-        None if they are inconsistent."""
-        result = self._solver.propagate(list(current_facts))
-        return None if result is None else set(result)
+        None if they are inconsistent. Cached: closed-node matching probes the
+        same (observed + obs_set) combinations over and over."""
+        key = frozenset(current_facts)
+        cached = self._closure_cache.get(key, False)
+        if cached is not False:
+            return cached
+        if self.factored:
+            result = self._factored_closure(key)
+        else:
+            result = self._solver.propagate(list(key))
+            result = None if result is None else set(result)
+        if len(self._closure_cache) > 200000:
+            self._closure_cache.clear()
+        self._closure_cache[key] = result
+        return result
+
+    def _factored_closure(self, current_facts):
+        """Exact closure for independent positive oneof groups, without any
+        solver call: an observed positive collapses its group; eliminating all
+        but one member entails the survivor."""
+        closure = set(current_facts)
+        for group in self.oneof_groups:
+            pos = [b for b in group if b in closure]
+            if len(pos) > 1:
+                return None  # two members of a oneof both true
+            if pos:
+                closure.update("NOT_" + b for b in group if b != pos[0])
+                continue
+            alive = [b for b in group if ("NOT_" + b) not in closure]
+            if not alive:
+                return None  # every member eliminated
+            if len(alive) == 1:
+                closure.add(alive[0])
+        return closure
+
+    def canonical_world(self, current_facts):
+        """The lexicographically-least hidden assignment consistent with
+        current_facts (first surviving member of each oneof group), or None
+        when the constraint system is not factored. Canonical sampling keeps
+        plans identical across beliefs with equal knowledge, so meta-planner
+        subtrees reconverge instead of chasing arbitrary Z3 models."""
+        if not self.factored:
+            return None
+        closure = self.propagate(current_facts)
+        if closure is None:
+            return None
+        world = set()
+        for group in self.oneof_groups:
+            alive = [b for b in group if ("NOT_" + b) not in closure]
+            if not alive:
+                return None
+            world.add(alive[0])
+        return world
 
     def complete(self, current_facts):
         """One consistent full assignment (set of true constraint-fluent names)
@@ -131,6 +198,8 @@ class MiniSATSolver:
         return None if result is None else set(result)
     
     def add_hidden_clause(self, new_hidden_fact, clause):
+        self.factored = False  # correlations break group independence
+        self._closure_cache.clear()  # constraints changed
         if new_hidden_fact not in self.unknown_facts:
             self.unknown_facts.add(new_hidden_fact)
             self._solver.set_unknown(sorted(self.unknown_facts))
@@ -216,11 +285,17 @@ class RegressionBelief:
     Tracks the exact set of possible worlds to fully support conditional effects
     over uncertain variables without losing information."""
 
-    def __init__(self, sat_solver, worlds, history=(), plan=()):
+    def __init__(self, sat_solver, worlds, history=(), plan=(), expect=None):
         self.sat = sat_solver
         self.worlds = frozenset(frozenset(w) for w in worlds)
         self.history = tuple(history)
         self.plan = tuple(plan)
+        # Parallel to `plan`: the observation outcome (True/False) the plan
+        # ASSUMED for each embedded sensing step (None for non-sensing steps
+        # or when no assumption is known). Drives branch continuity at
+        # observation nodes; deliberately NOT part of signature() -- a node's
+        # subtree is valid for any belief with the same (worlds, plan).
+        self.expect = tuple(expect) if expect is not None else (None,) * len(self.plan)
 
     def current_true_facts(self):
         """Returns the intersection of all possible worlds (facts known to be true in all)."""
@@ -240,18 +315,22 @@ class RegressionBelief:
         return None
 
     def progress(self, action):
-        new_plan = self.plan[1:] if (self.plan and self.plan[0] == action.name) else self.plan
+        advance = bool(self.plan) and self.plan[0] == action.name
+        new_plan = self.plan[1:] if advance else self.plan
+        new_expect = self.expect[1:] if advance else self.expect
         new_worlds = [action.apply(w) for w in self.worlds]
-        return RegressionBelief(self.sat, new_worlds, self.history + (action,), new_plan)
+        return RegressionBelief(self.sat, new_worlds, self.history + (action,), new_plan, new_expect)
 
     def progress_nondet(self, action, outcome_idx):
         """Belief after executing a non-deterministic action (Sec 5.7) whose
         outcome turned out to be `outcome_idx`. The meta-planner branches once
         per outcome (like a sensing observation), so within this branch the
         chosen outcome is applied uniformly to every currently-possible world."""
-        new_plan = self.plan[1:] if (self.plan and self.plan[0] == action.name) else self.plan
+        advance = bool(self.plan) and self.plan[0] == action.name
+        new_plan = self.plan[1:] if advance else self.plan
+        new_expect = self.expect[1:] if advance else self.expect
         new_worlds = [action.apply_outcome(w, outcome_idx) for w in self.worlds]
-        return RegressionBelief(self.sat, new_worlds, self.history + (action,), new_plan)
+        return RegressionBelief(self.sat, new_worlds, self.history + (action,), new_plan, new_expect)
 
     def observe(self, literal):
         neg = literal.startswith("NOT_")
@@ -262,13 +341,152 @@ class RegressionBelief:
                 new_worlds.append(w)
         if not new_worlds:
             return None
-        return RegressionBelief(self.sat, new_worlds, self.history, self.plan)
+        return RegressionBelief(self.sat, new_worlds, self.history, self.plan, self.expect)
 
-    def with_plan(self, plan):
-        return RegressionBelief(self.sat, self.worlds, self.history, plan)
+    def with_plan(self, plan, expect=None):
+        return RegressionBelief(self.sat, self.worlds, self.history, plan, expect)
 
     def signature(self):
         return (self.worlds, self.plan)
+
+    def sample_worlds(self):
+        """Yield full possible worlds (fact sets), most-preferred first."""
+        return iter(self.worlds)
+
+    def literal_holds_after(self, extra_literals, literal):
+        """Algorithm 3 lines 8-11: would `literal` hold in every possible world
+        consistent with also observing every literal in `extra_literals`?
+        Vacuously True if no world survives the filter (that observation
+        combination cannot occur along this branch, so it cannot violate the
+        match either)."""
+        def matches(world, lit):
+            neg = lit.startswith("NOT_")
+            base = lit[4:] if neg else lit
+            return (base not in world) if neg else (base in world)
+
+        filtered = [w for w in self.worlds if all(matches(w, o) for o in extra_literals)]
+        if not filtered:
+            return True
+        return all(matches(w, literal) for w in filtered)
+
+
+class LazyBelief:
+    """SAT-backed belief for simple domains whose hidden fluents are STATIC
+    and directly sensable (doors, colorballs: no KT need, no effect ever
+    modifies an unknown fact).
+
+    In such domains every possible world shares one identical dynamic state,
+    so the belief factors into (dynamic facts, observed hidden literals);
+    hidden knowledge is the Z3 closure of the initial-state constraints plus
+    the observations, computed by the C++ BeliefSolver. This replaces explicit
+    world enumeration, which is unsound once the world count passes the
+    enumeration cap (doors15: 15^7 worlds vs a cap of 4000) and costs
+    O(#worlds) on every belief operation."""
+
+    def __init__(self, sat_solver, facts, observed=(), history=(), plan=(), expect=None):
+        self.sat = sat_solver
+        self.facts = frozenset(facts)
+        self.observed = frozenset(observed)
+        self.history = tuple(history)
+        self.plan = tuple(plan)
+        self.expect = tuple(expect) if expect is not None else (None,) * len(self.plan)
+        self._closure = None  # lazily-computed hidden-literal closure
+
+    def closure(self):
+        if self._closure is None:
+            self._closure = self.sat.propagate(self.observed) or set()
+        return self._closure
+
+    def current_true_facts(self):
+        return frozenset(self.facts
+                         | {l for l in self.closure() if not l.startswith("NOT_")})
+
+    def known_value(self, base):
+        if base in self.sat.unknown_facts:
+            cl = self.closure()
+            if base in cl:
+                return True
+            if ("NOT_" + base) in cl:
+                return False
+            return None
+        # Dynamic fluents are closed-world over the shared fact set.
+        return base in self.facts
+
+    def progress(self, action):
+        advance = bool(self.plan) and self.plan[0] == action.name
+        new_plan = self.plan[1:] if advance else self.plan
+        new_expect = self.expect[1:] if advance else self.expect
+        b = LazyBelief(self.sat, action.apply(self.facts), self.observed,
+                       self.history + (action,), new_plan, new_expect)
+        b._closure = self._closure  # hidden fluents are static
+        return b
+
+    def observe(self, literal):
+        neg = literal.startswith("NOT_")
+        base = literal[4:] if neg else literal
+        if base not in self.sat.unknown_facts:
+            # Closed-world dynamic fact: the outcome either matches the state
+            # (no information) or is impossible.
+            return None if (base in self.facts) == neg else self
+        cl = self.closure()
+        if literal in cl:
+            return self  # already entailed: no new information
+        if (base if neg else "NOT_" + base) in cl:
+            return None  # outcome contradicts current knowledge
+        nb = LazyBelief(self.sat, self.facts, self.observed | {literal},
+                        self.history, self.plan, self.expect)
+        new_closure = self.sat.propagate(nb.observed)
+        if new_closure is None:
+            return None  # outcome inconsistent with the constraints
+        nb._closure = new_closure
+        return nb
+
+    def with_plan(self, plan, expect=None):
+        b = LazyBelief(self.sat, self.facts, self.observed, self.history, plan, expect)
+        b._closure = self._closure
+        return b
+
+    def signature(self):
+        return (self.facts, self.observed, self.plan)
+
+    def sample_worlds(self, cap=16):
+        """Yield full possible worlds: the shared dynamic facts joined with a
+        hidden-fluent assignment. The first sample is CANONICAL (first
+        surviving member per oneof group) so beliefs with equal knowledge get
+        identical plans and the meta-planner's subtrees reconverge; the
+        solver-backed samples only run if a caller rejects it and keeps
+        iterating (e.g. the goal-violating filter on a hidden goal)."""
+        first = self.sat.canonical_world(self.observed)
+        if first is None:
+            first = self.sat.complete(sorted(self.observed))
+            if first is None:
+                return
+        first = frozenset(self.facts | first)
+        yield first
+        for model in self.sat.enumerate_models(sorted(self.observed), cap):
+            world = frozenset(self.facts | model)
+            if world != first:
+                yield world
+
+    def literal_holds_after(self, extra_literals, literal):
+        """Entailment counterpart of RegressionBelief.literal_holds_after,
+        answered by the SAT solver instead of world filtering."""
+        neg = literal.startswith("NOT_")
+        base = literal[4:] if neg else literal
+        hidden_extra = []
+        for lit in extra_literals:
+            e_neg = lit.startswith("NOT_")
+            e_base = lit[4:] if e_neg else lit
+            if e_base in self.sat.unknown_facts:
+                hidden_extra.append(lit)
+            elif (e_base in self.facts) == e_neg:
+                return True  # observation impossible here: vacuously true
+        if base not in self.sat.unknown_facts:
+            return (base not in self.facts) if neg else (base in self.facts)
+        closure = self.sat.propagate(self.observed | set(hidden_extra))
+        if closure is None:
+            return True  # observation combination impossible: vacuously true
+        return literal in closure
 
 class NativeSDRImpl:
     def __init__(self, problem, problem_file=None, error_on_failed_checks=False, nondet_effects=None):
@@ -299,10 +517,14 @@ class NativeSDRImpl:
         # FF sanitizes '-' to '_' in action names; keep a normalized lookup so we can
         # map FF's reported name back to the canonical grounded action key.
         self.normalized_action_map = {name.replace("-", "_"): name for name in self.dynamic_actions}
+        # observe-fact -> ALL sensing actions for it (a fact can be sensable
+        # from several positions; the injector must pick one applicable NOW).
         self.sensing_map = {}
         for name, act in self.dynamic_actions.items():
             if act.is_sensing and act.observe:
-                self.sensing_map[act.observe] = name
+                self.sensing_map.setdefault(act.observe, []).append(name)
+        for names in self.sensing_map.values():
+            names.sort()
 
         # Derive hidden-fact correlations from conditional effects whose condition
         # references an already-hidden fact (e.g. localize5's `free-up` is correlated
@@ -384,6 +606,20 @@ class NativeSDRImpl:
             for g, _pol in cond_lits
         )
 
+        # LazyBelief eligibility: simple domain, no KT need, and no effect ever
+        # MODIFIES an unknown fact (hidden fluents are static, so every possible
+        # world shares one dynamic state and hidden knowledge never goes stale).
+        # Then the belief needs no world enumeration at all -- crucial when the
+        # world count dwarfs the enumeration cap (doors15: 15^7 worlds).
+        hidden_modified = any(
+            f in self.sat_solver.unknown_facts
+            for info in self.kt_action_info
+            for f in (list(info["add"]) + list(info["del"])
+                      + [fl for _c, fl, _a in info.get("cond", [])])
+        )
+        self.use_lazy_belief = (self.is_simple_domain and not self.needs_kt
+                                and not hidden_modified)
+
         self._grounded_action_map = None  # built lazily via the UP grounder
 
     @property
@@ -401,12 +637,47 @@ class NativeSDRImpl:
         preds = [cpor_engine.Predicate(f) for f in current_facts]
         return self.compiled_goal.is_true(preds)
 
-    def get_next_action(self, belief):
+    def get_next_action(self, belief, retry=0):
         """Return (action, belief) where belief may carry a freshly-committed plan.
-        Returns (None, belief) at the goal or a genuine dead end."""
+        Returns (None, belief) at the goal or a genuine dead end.
+
+        ``retry`` > 0 is the loop-escape mode (the C# StuckInLoop analogue):
+        the meta-planner re-entered a belief already open on the current
+        recursion path, so the normal deterministic choice below would repeat
+        the ancestor's step forever. Mutate the strategy instead of re-deriving
+        the same plan: gather information first (sensing shrinks the world set,
+        so the signature can never recur), then replan from a DIFFERENT
+        consistent world sample."""
         current_facts = belief.current_true_facts()
 
         if self.is_goal_facts(current_facts):
+            return None, belief
+
+        if retry:
+            belief = belief.with_plan(())
+            # (a) directly applicable sensing on an unknown fluent
+            for name in sorted(self.dynamic_actions):
+                act = self.dynamic_actions[name]
+                if (act.is_sensing and act.observe in self.sat_solver.unknown_facts
+                        and belief.known_value(act.observe) is None
+                        and act.preconditions <= current_facts):
+                    return act, belief
+            # (b) plan toward an unknown sensing action's preconditions
+            chosen = self._plan_to_observe(belief, current_facts)
+            if chosen is not None:
+                return chosen
+            # (c) replan from an alternative world sample (a different Z3
+            #     model than the one the looping plan was derived from);
+            #     goal-satisfying worlds yield the ambiguous empty plan, skip.
+            candidates = (w for w in belief.sample_worlds() if not self.is_goal_facts(w))
+            worlds = sorted(itertools.islice(candidates, 32), key=sorted)
+            if worlds:
+                sample = worlds[retry % len(worlds)]
+                plan = self._ff_plan_cached(frozenset(sample))
+                if plan:
+                    chosen = self._follow_committed_plan(belief.with_plan(tuple(plan)), current_facts)
+                    if chosen is not None:
+                        return chosen
             return None, belief
 
         # 1. Follow the committed plan if there is one and it is still valid.
@@ -416,20 +687,31 @@ class NativeSDRImpl:
 
         # 2. Determinize via the KT (knowledge) translation -- only for domains
         #    that need deduced (not directly sensed) hidden preconditions.
-        plan = self._kt_determinize(belief) if self.needs_kt else []
+        plan, expect = self._kt_determinize(belief) if self.needs_kt else ([], None)
         if plan:
-            return self._follow_committed_plan(belief.with_plan(tuple(plan)), current_facts) \
+            return self._follow_committed_plan(belief.with_plan(tuple(plan), expect), current_facts) \
                 or (None, belief)
 
         # 2b. Fallback: consistent world (Z3 model) progressed through history.
-        full_state = list(belief.worlds)[0] if belief.worlds else frozenset()
+        #     Sample a world where the goal is NOT yet satisfied: a goal-
+        #     satisfying world yields an EMPTY classical plan, which is
+        #     indistinguishable from "no plan found" and used to dead-end
+        #     solvable beliefs (localize5: sampling the at-goal world). At
+        #     least one goal-violating world exists here, else is_goal_facts
+        #     above would have ended the node.
+        full_state = next((w for w in belief.sample_worlds() if not self.is_goal_facts(w)),
+                          frozenset())
         plan = self._ff_plan_cached(frozenset(full_state))
         if not plan:
             optimistic = set(belief.current_true_facts())
             for f in self.sat_solver.unknown_facts:
                 if belief.known_value(f) is None:
                     optimistic.add(f)
-            plan = self._ff_plan_cached(frozenset(optimistic))
+            # The optimistic state can satisfy the goal trivially (it sets every
+            # unknown true at once); planning from it would again yield the
+            # ambiguous empty plan, so skip it in that case.
+            if not self.is_goal_facts(optimistic):
+                plan = self._ff_plan_cached(frozenset(optimistic))
 
         if plan:
             chosen = self._follow_committed_plan(belief.with_plan(tuple(plan)), current_facts)
@@ -473,10 +755,9 @@ class NativeSDRImpl:
         and follow it (the sensing action itself is appended so it fires on arrival).
         Returns (action, belief) or None if nothing can be set up to observe."""
         
-        # New Explicit World Tracking logic: just pick a valid progressed world
-        if not belief.worlds:
+        full_state = next(iter(belief.sample_worlds()), None)
+        if full_state is None:
             return None
-        full_state = list(belief.worlds)[0]
 
         for name in sorted(self.dynamic_actions):
             act = self.dynamic_actions[name]
@@ -507,15 +788,20 @@ class NativeSDRImpl:
     KT_MAX_TAGS = 300       # max distinct tags handed to FF (tractability of the KT domain)
 
     def _kt_determinize(self, belief):
+        """Returns (plan, expect): the KT plan's action names plus, parallel to
+        it, the observation outcome each embedded sensing step ASSUMES (the
+        value in the sample world -- tag 0's world -- progressed to that step).
+        The suffix after a sensing step is valid exactly on the branch matching
+        that assumption (branch continuity)."""
         worlds = list(belief.worlds)
         if not worlds or len(worlds) > self.MODEL_ENUM_CAP:
-            return []
+            return [], None
 
         union = set().union(*worlds)
         uncertain = {f for f in union if any(f in w for w in worlds) and any(f not in w for w in worlds)}
 
         if not uncertain:
-            return self._run_cpp_ff_plan(worlds[0])
+            return self._run_cpp_ff_plan(worlds[0]), None
 
         known_true = set.intersection(*[set(w) for w in worlds])
         seen, tags = set(), []
@@ -526,7 +812,7 @@ class NativeSDRImpl:
                 tags.append(t)
 
         if len(tags) > self.KT_MAX_TAGS:
-            return []
+            return [], None
 
         actions_arg = [(a["name"], a["is_sensing"], a["observe"], a["pre"], a["add"], a["del"], a.get("cond", []))
                        for a in self.kt_action_info]
@@ -546,7 +832,17 @@ class NativeSDRImpl:
                 plan.append(name)
             elif name in self.normalized_action_map:
                 plan.append(self.normalized_action_map[name])
-        return plan
+
+        # Simulate the sample world (worlds[0], whose uncertain-projection is
+        # tag 0 -- the tag the KT sensing actions sample their outcome from)
+        # through the plan to record each sensing step's assumed observation.
+        sim = set(worlds[0])
+        expect = []
+        for name in plan:
+            act = self.dynamic_actions[name]
+            expect.append((act.observe in sim) if act.is_sensing and act.observe else None)
+            sim = act.apply(sim)
+        return plan, expect
 
     def _ff_solve_pddl(self, domain_str, problem_str):
         # In-memory: FF parses the PDDL straight from these strings (fmemopen),
@@ -573,6 +869,21 @@ class NativeSDRImpl:
         if act is None:
             return None  # stale name -> replan
 
+        if act.is_sensing and act.observe:
+            kv = belief.known_value(act.observe)
+            if kv is not None:
+                # The committed sensing step's outcome became known en route
+                # (knowledge can arrive between commit and execution now that
+                # plans survive observations). Mirrors the C#'s "observation
+                # action for something that is already known -- continue with
+                # the same state": skip the no-op step, unless the plan's
+                # assumed outcome is contradicted, in which case the suffix
+                # is invalid and the caller must replan.
+                if belief.expect[0] is not None and kv != belief.expect[0]:
+                    return None
+                return self._follow_committed_plan(
+                    belief.with_plan(plan[1:], belief.expect[1:]), current_facts)
+
         missing = act.preconditions - current_facts
         if not missing:
             return act, belief  # applicable now; progress() will advance the plan
@@ -584,11 +895,19 @@ class NativeSDRImpl:
             if value is False and missing_fact in self.sat_solver.unknown_facts:
                 return None  # real world contradicts the committed plan -> replan
             if value is None:
-                if missing_fact in self.sensing_map:
-                    return self.dynamic_actions[self.sensing_map[missing_fact]], belief
+                # Inject a sensor for the unknown precondition -- but only one
+                # whose OWN preconditions hold here (a fact can be sensable
+                # from several positions; injecting an inapplicable sensor put
+                # physically impossible observations into the plan graph and
+                # poisoned the closed-node K sets with foreign positions).
+                for sense_name in self.sensing_map.get(missing_fact, ()):
+                    sense_act = self.dynamic_actions[sense_name]
+                    if sense_act.preconditions <= current_facts:
+                        return sense_act, belief
                 if missing_fact in self.sat_solver.unknown_facts:
-                    # Unknown but not directly sensable (e.g. wumpus `safe`): it has
-                    # to be DEDUCED from other observations via the constraints.
+                    # Not directly sensable -- either nowhere (wumpus `safe`,
+                    # must be DEDUCED) or just not from the current position
+                    # (replanning / plan-to-observe will route to a sensor).
                     indirect_unknown = True
 
         if indirect_unknown:
@@ -636,6 +955,19 @@ class NativeSDRImpl:
         return plan
 
 class CPORMetaPlanner:
+    # Loop-escape budget: how many times one signature may be re-entered on
+    # the current path (each retry mutates the planning strategy) before the
+    # branch is declared a DEAD END.
+    MAX_LOOP_RETRIES = 4
+
+    # Closed-node observation sets past this size make the node unmergeable
+    # (see _strip_non_hidden); keeps the O(n,l) bookkeeping bounded. Must
+    # comfortably exceed the longest sensing CHAIN in a domain (a chain of d
+    # sensings legitimately accumulates ~d sets for its deepest deduced
+    # literal -- doors15: 14 per column; capping below that poisons exactly
+    # the reusable chain-entrance nodes).
+    MAX_OBS_SETS_PER_LITERAL = 40
+
     def __init__(self, simulator, online_planner):
         self.online_planner = online_planner
         self.visited_beliefs = {}
@@ -651,6 +983,16 @@ class CPORMetaPlanner:
         self._closed_node_graph = {}  # closed-node id -> the graph node it was built for
         self._node_info = {}          # id(graph node dict) -> its ClosedNodeInfo dict
 
+        # base fluent -> its oneof group, for the factored observation-set
+        # projection in _strip_non_hidden.
+        self._obs_group_of = {}
+        sat = getattr(online_planner, "sat_solver", None)
+        if sat is not None:
+            for group in getattr(sat, "oneof_groups", []):
+                members = frozenset(group)
+                for base in group:
+                    self._obs_group_of[base] = members
+
         # Sec 5.7 ancestor-based cycle detection for non-deterministic domains,
         # backed by the C++ AncestorCycleGuard (mirrors the C#'s AlreadyVisited/
         # DetectInfiniteLoop(Complete)). Only meaningful (and only enabled) when
@@ -660,9 +1002,21 @@ class CPORMetaPlanner:
         self.cycle_guard = cpor_engine.AncestorCycleGuard()
         self._ancestor_nodes = []  # parallel stack of node dicts, index = cycle_guard depth
 
+        # Loop escaping (the C# StuckInLoopPlanBased analogue, with a working
+        # escape): signatures of nodes OPEN on the current recursion path, with
+        # a repeat count. Re-entering an open signature means the planner's
+        # deterministic choice is cycling; instead of silently emitting a
+        # cycle edge (an invalid plan in deterministic domains), re-choose via
+        # get_next_action(retry=count), which mutates the strategy. Bounded by
+        # MAX_LOOP_RETRIES, then the branch is an honest DEAD END.
+        self._open_sigs = {}
+
     def make_initial_belief(self, initial_true_facts):
-        """Build the root Belief by enumerating all valid initial models ONCE."""
+        """Build the root Belief: SAT-backed (no enumeration) for eligible
+        simple domains, else by enumerating all valid initial models ONCE."""
         known_pos = {f for f in initial_true_facts if not f.startswith("NOT_")}
+        if getattr(self.online_planner, "use_lazy_belief", False):
+            return LazyBelief(self.online_planner.sat_solver, known_pos)
         models = self.online_planner.sat_solver.enumerate_models(list(initial_true_facts), 4000)
 
         worlds = []
@@ -690,23 +1044,6 @@ class CPORMetaPlanner:
                 hidden.add(f)
         return known, hidden
 
-    @staticmethod
-    def _literal_holds_after(worlds, extra_literals, literal):
-        """Algorithm 3 lines 8-11: would `literal` hold in every one of `worlds`
-        consistent with also observing every literal in `extra_literals`?
-        Vacuously True if no world survives the filter (that observation
-        combination cannot occur along this branch, so it cannot violate the
-        match either)."""
-        def matches(world, lit):
-            neg = lit.startswith("NOT_")
-            base = lit[4:] if neg else lit
-            return (base not in world) if neg else (base in world)
-
-        filtered = [w for w in worlds if all(matches(w, o) for o in extra_literals)]
-        if not filtered:
-            return True
-        return all(matches(w, literal) for w in filtered)
-
     def _find_equivalent_closed_node(self, belief, known, hidden):
         """Algorithm 3 (GetClosedNode): a structurally-compatible closed node
         (K(n') subseteq known, H(n') subseteq hidden) whose recorded
@@ -718,7 +1055,7 @@ class CPORMetaPlanner:
             candidate = self.closed_index.info(match["id"])
             observation_sets = candidate["observation_sets"]
             if all(
-                self._literal_holds_after(belief.worlds, obs_set, lit)
+                belief.literal_holds_after(obs_set, lit)
                 for lit in match["pending_literals"]
                 for obs_set in observation_sets.get(lit, [])
             ):
@@ -726,9 +1063,72 @@ class CPORMetaPlanner:
         return None
 
     def _register_closed_node(self, node, info):
+        info = self._strip_non_hidden(info)
         node_id = self.closed_index.register(info)
         self._closed_node_graph[node_id] = node
         self._node_info[id(node)] = info
+
+    def _strip_non_hidden(self, info):
+        """update_sensing's ReasonedT/F fold treats ANY literal known in one
+        branch but not the other as 'resolved by this observation' and puts it
+        in H(n). But branch ROUTES also differ in static/dynamic facts (e.g. a
+        route using door opened_p3-1 needs that static fact; the other route
+        doesn't) -- those are never members of hidden(b), so one such entry
+        makes the node permanently unmatchable in find_candidates. They already
+        stay in K(n) (update_sensing unions both branches' K), where the
+        K(n') <= known(b) check handles them exactly; H(n)/O(n,l) are only
+        about genuinely-hidden reasoning, so restrict them to unknown facts."""
+        sat = self.online_planner.sat_solver
+        unknown = sat.unknown_facts
+        hidden = set(h for h in info["hidden"] if h in unknown)
+        # Every sensing fold prefix-copies the children's observation sets
+        # (prefixed with the ancestor's own observation), so they grow
+        # combinatorially with depth. In a FACTORED constraint system
+        # (independent positive oneof groups) those foreign-group prefixes are
+        # semantically inert: S entails l exactly through the literals of l's
+        # own group. Projecting each set onto the group before deduping keeps
+        # O(n,l) at ~group-size sets and is sound -- a projected set is a
+        # subset of the original, so the merge-time entailment check only gets
+        # HARDER to satisfy, never easier.
+        factored = getattr(sat, "factored", False)
+        observation_sets, overflowed = {}, False
+        for lit, sets in info["observation_sets"].items():
+            base = lit[4:] if lit.startswith("NOT_") else lit
+            if base not in unknown:
+                continue
+            if factored:
+                group = self._obs_group_of.get(base, (base,))
+                unique = {tuple(x for x in s
+                                if (x[4:] if x.startswith("NOT_") else x) in group)
+                          for s in sets}
+            else:
+                unique = {tuple(s) for s in sets}
+            if len(unique) > self.MAX_OBS_SETS_PER_LITERAL:
+                # Cap overflow: this node's recorded reasoning for `lit` is too
+                # rich to keep, so the node cannot prove it is reusable -- mark
+                # it unmatchable. (Degrading `lit` to a K requirement instead
+                # is NOT safe: the degrade hits one sibling branch and not the
+                # other, and update_sensing reads any K asymmetry between
+                # siblings as "resolved by this observation", recording a bogus
+                # singleton observation set that then fails the semantic check
+                # for every future belief and blocks ALL merges into every
+                # ancestor -- the doors15 duplicate-subtree explosion.)
+                overflowed = True
+                hidden.discard(base)
+            else:
+                observation_sets[lit] = [list(s) for s in unique]
+        # A literal with an observation set is resolved by reasoning INSIDE the
+        # subtree; update_sensing nevertheless leaves it in K(n), where the
+        # syntactic K(n') <= known(b) prefilter would demand every future
+        # belief already know it -- defeating the semantic pending-literal
+        # check and snowballing K through every fold until nothing matches.
+        known = [k for k in info["known"] if k not in observation_sets]
+        if overflowed and "__unmergeable__" not in known:
+            # No belief ever knows this pseudo-literal, so find_candidates can
+            # never return this node (nor any ancestor: K folds upward).
+            known.append("__unmergeable__")
+        return {"known": known, "hidden": sorted(hidden),
+                "observation_sets": observation_sets}
 
     def _goal_closed_info(self, known):
         goal_literals = [name if pol else "NOT_" + name
@@ -763,7 +1163,8 @@ class CPORMetaPlanner:
                 return node
 
         bs_hash = belief.signature()
-        if bs_hash in self.visited_beliefs:
+        open_count = self._open_sigs.get(bs_hash, 0)
+        if bs_hash in self.visited_beliefs and open_count == 0:
             return self.visited_beliefs[bs_hash]
 
         if self.online_planner.is_goal_facts(current_facts):
@@ -781,21 +1182,42 @@ class CPORMetaPlanner:
             self.visited_beliefs[bs_hash] = node
             return node
 
-        action, belief = self.online_planner.get_next_action(belief)
+        if open_count >= self.MAX_LOOP_RETRIES:
+            return {"action": "DEAD END", "children": []}
+
+        action, belief = self.online_planner.get_next_action(belief, retry=open_count)
         if action is None:
             return {"action": "DEAD END", "children": []}
 
         node = {"action": action.name, "children": []}
-        self.visited_beliefs[bs_hash] = node
+        if open_count == 0:
+            # A retry rebuild must not displace the open ancestor that owns
+            # this signature in the memo.
+            self.visited_beliefs[bs_hash] = node
         is_nondet = getattr(action, "is_nondet", False)
 
         if self.cycle_detection_enabled:
             self.cycle_guard.push(sorted(current_facts), via_observation)
             self._ancestor_nodes.append(node)
 
+        self._open_sigs[bs_hash] = open_count + 1
         try:
             if action.is_sensing:
                 obs = action.observe
+                # Branch continuity (mirrors the C#'s plan-suffix reuse at
+                # observation splits). Two cases:
+                #  - EMBEDDED sensing (the committed plan's own head, from a KT
+                #    plan): the suffix stays valid exactly on the branch
+                #    matching the outcome the plan assumed (belief.expect[0],
+                #    simulated from the sample world at determinize time);
+                #    the other branch clears and replans.
+                #  - INJECTED sensing (_follow_committed_plan sensing an
+                #    unknown precondition; the plan head is a later action):
+                #    keep the plan on BOTH branches -- the follow logic itself
+                #    replans when the observation contradicts a needed
+                #    precondition, and re-uses the plan when it holds.
+                in_plan = bool(belief.plan) and belief.plan[0] == action.name
+                expected = belief.expect[0] if in_plan else None
                 child_info = {}
                 for value, label, key in ((obs, f"Observed: {obs} == True", True),
                                            (f"NOT_{obs}", f"Observed: {obs} == False", False)):
@@ -803,11 +1225,13 @@ class CPORMetaPlanner:
                     if next_belief is None:
                         child = {"action": "DEAD END", "children": []}
                     else:
-                        # SDR: replan at every observation. Clear the committed plan so
-                        # each branch re-determinizes from its own belief, instead of
-                        # following the sample world's plan into a diverging branch
-                        # (which caused re-sensing and impossible-branch dead ends).
-                        child = self.build_plan_graph(next_belief.with_plan(()), via_observation=True)
+                        if in_plan:
+                            if expected is not None and key == expected:
+                                next_belief = next_belief.with_plan(
+                                    next_belief.plan[1:], next_belief.expect[1:])
+                            else:
+                                next_belief = next_belief.with_plan(())
+                        child = self.build_plan_graph(next_belief, via_observation=True)
                     node["children"].append((label, child))
                     child_info[key] = self._node_info.get(id(child))
 
@@ -838,6 +1262,10 @@ class CPORMetaPlanner:
                             child_info, list(action.preconditions), effects)
                         self._register_closed_node(node, info)
         finally:
+            if open_count == 0:
+                self._open_sigs.pop(bs_hash, None)
+            else:
+                self._open_sigs[bs_hash] = open_count
             if self.cycle_detection_enabled:
                 self.cycle_guard.pop()
                 self._ancestor_nodes.pop()

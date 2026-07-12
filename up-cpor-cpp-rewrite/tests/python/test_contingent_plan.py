@@ -71,7 +71,7 @@ def _run_from_rewrite_root(monkeypatch):
     monkeypatch.chdir(_REWRITE_ROOT)
 
 
-@pytest.mark.parametrize("domain", ["blocks2", "blocks3", "blocks7", "doors5", "colorballs2-2"])
+@pytest.mark.parametrize("domain", ["blocks2", "blocks3", "blocks7", "doors5", "colorballs2-2", "localize5", "doors15"])
 def test_all_branches_reach_goal(domain):
     plan = _build_plan(domain)
     leaves = []
@@ -81,6 +81,17 @@ def test_all_branches_reach_goal(domain):
     assert all(leaf == "GOAL REACHED" for leaf in leaves), (
         f"{domain}: expected every branch to reach the goal, got leaves={leaves}"
     )
+
+
+def test_doors15_graph_stays_compact():
+    """doors15 has 15^7 possible worlds, far past any enumeration cap; the
+    plan graph stays tractable ONLY while sweep-entrance closed-node merges
+    fire (LazyBelief + the factored observation-set projection in
+    _strip_non_hidden). The C# reference plan is ~520 nodes; a merge
+    regression shows up as thousands of nodes and minutes of runtime, so pin
+    the order of magnitude."""
+    plan = _build_plan("doors15")
+    assert len(_count_unique_nodes(plan)) < 1200
 
 
 def test_blocks3_branches_on_sensing():
@@ -108,9 +119,11 @@ def test_compaction_shrinks_or_matches_baseline(domain):
 
     assert all(leaf == "GOAL REACHED" for leaf in leaves_compacted)
     assert all(leaf == "GOAL REACHED" for leaf in leaves_baseline)
-    assert len(leaves_compacted) == len(leaves_baseline), (
-        f"{domain}: compaction changed the number of goal leaves"
-    )
+    # NOTE: leaf COUNTS are deliberately not compared. They coincided while
+    # every branch replanned from scratch, but with branch continuity (plan
+    # suffixes surviving observations) compaction reroutes onto shared
+    # suffixes and the two builds legitimately explore different -- equally
+    # valid, all-goal -- contingency trees (seen on wumpus05).
 
     nodes_compacted = len(_count_unique_nodes(compacted))
     nodes_baseline = len(_count_unique_nodes(baseline))
@@ -120,10 +133,14 @@ def test_compaction_shrinks_or_matches_baseline(domain):
     )
 
 
-@pytest.mark.parametrize("domain", ["blocks2", "blocks7", "doors5", "colorballs2-2", "wumpus05"])
+@pytest.mark.parametrize("domain", ["blocks7", "doors5", "colorballs2-2", "wumpus05"])
 def test_compaction_finds_real_non_exact_equivalences(domain):
     """On these domains compaction must do more than exact-signature dedup:
-    the compacted graph is STRICTLY smaller than the forced-off baseline."""
+    the compacted graph is STRICTLY smaller than the forced-off baseline.
+
+    blocks2 used to belong here (5 -> 4 nodes) until branch continuity made
+    the un-compacted baseline itself 4 nodes -- the domain is now too small to
+    exhibit non-exact reuse; it stays covered by the <= test above."""
     compacted = _build_plan(domain, force_compaction=None)
     baseline = _build_plan(domain, force_compaction=False)
     assert len(_count_unique_nodes(compacted)) < len(_count_unique_nodes(baseline)), (
