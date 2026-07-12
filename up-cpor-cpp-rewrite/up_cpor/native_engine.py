@@ -170,9 +170,28 @@ class DynamicAction:
         self.add_effects = set(info["add"])
         self.del_effects = set(info["del"])
         self.cond_effects = info.get("cond", [])   # [(cond_lits, fluent, is_add)]
+        # Sec 5.7: non-deterministic outcomes -- each a list of (fluent, is_add)
+        # literals; None/[] for every deterministic/sensing action.
+        self.nondet_outcomes = info.get("nondet") or []
+
+    @property
+    def is_nondet(self):
+        return bool(self.nondet_outcomes)
 
     def is_applicable(self, state_fact_names):
         return self.preconditions.issubset(state_fact_names)
+
+    def apply_outcome(self, pre_state, outcome_idx):
+        """Progress pre_state through non-deterministic outcome `outcome_idx`
+        (mirrors `apply()`, but for one specific psi-outcome rather than the
+        single deterministic effect set)."""
+        new_facts = set(pre_state)
+        for fluent, is_add in self.nondet_outcomes[outcome_idx]:
+            if is_add:
+                new_facts.add(fluent)
+            else:
+                new_facts.discard(fluent)
+        return new_facts
 
     def effect_on(self, fact, pre_state):
         if fact in self.add_effects: return True
@@ -225,6 +244,15 @@ class RegressionBelief:
         new_worlds = [action.apply(w) for w in self.worlds]
         return RegressionBelief(self.sat, new_worlds, self.history + (action,), new_plan)
 
+    def progress_nondet(self, action, outcome_idx):
+        """Belief after executing a non-deterministic action (Sec 5.7) whose
+        outcome turned out to be `outcome_idx`. The meta-planner branches once
+        per outcome (like a sensing observation), so within this branch the
+        chosen outcome is applied uniformly to every currently-possible world."""
+        new_plan = self.plan[1:] if (self.plan and self.plan[0] == action.name) else self.plan
+        new_worlds = [action.apply_outcome(w, outcome_idx) for w in self.worlds]
+        return RegressionBelief(self.sat, new_worlds, self.history + (action,), new_plan)
+
     def observe(self, literal):
         neg = literal.startswith("NOT_")
         base = literal[4:] if neg else literal
@@ -243,7 +271,7 @@ class RegressionBelief:
         return (self.worlds, self.plan)
 
 class NativeSDRImpl:
-    def __init__(self, problem, problem_file=None, error_on_failed_checks=False):
+    def __init__(self, problem, problem_file=None, error_on_failed_checks=False, nondet_effects=None):
         get_environment().error_on_failed_checks = False
         self.problem = problem
         self.problem_file = problem_file  # source PDDL under test (informational)
@@ -262,7 +290,7 @@ class NativeSDRImpl:
         # is avoided here (it prunes, and is slow on large domains); it is only used
         # lazily for grounded_action_map (the engine API's UP ActionInstances).
         print("\n[SDR] Contingent grounding...")
-        self.kt_action_info = ground_actions(problem)
+        self.kt_action_info = ground_actions(problem, nondet_effects=nondet_effects)
         print(f"[SDR] {len(self.kt_action_info)} grounded actions.")
 
         self.dynamic_actions = {info["name"]: DynamicAction(info) for info in self.kt_action_info}
@@ -338,6 +366,24 @@ class NativeSDRImpl:
                     _collect_pred_names(e.condition, precond_preds)
         self.needs_kt = bool((precond_preds & hidden_preds) - sensed_preds)
 
+        # Sec 5.7: does this domain have any non-deterministic actuation
+        # action? Gates the ancestor-based cycle detection in CPORMetaPlanner.
+        self.has_nondet_actions = any(info.get("nondet") for info in self.kt_action_info)
+
+        # Sec 2.1's "simple contingent problem" test: hidden fluents are static
+        # (nothing here changes that -- DynamicAction never mutates a hidden
+        # fact), no hidden fluent appears in a conditional effect's CONDITION,
+        # and there are no non-deterministic actions. Gates the Sec 5.4
+        # belief-equivalence compaction (CPORMetaPlanner), which is only
+        # sound/complete for simple domains (mirrors the C#'s
+        # `if (!Domain.IsSimple) return IsGoalState();`).
+        self.is_simple_domain = (not self.has_nondet_actions) and not any(
+            g in self.sat_solver.unknown_facts
+            for info in self.kt_action_info
+            for cond_lits, _fluent, _is_add in info.get("cond", [])
+            for g, _pol in cond_lits
+        )
+
         self._grounded_action_map = None  # built lazily via the UP grounder
 
     @property
@@ -389,6 +435,16 @@ class NativeSDRImpl:
             chosen = self._follow_committed_plan(belief.with_plan(tuple(plan)), current_facts)
             if chosen is not None:
                 return chosen
+
+        # 2c. Sec 5.7 support: a non-deterministic action carries no add/del
+        #     effects FF can exploit (its outcomes are chosen by the
+        #     meta-planner's branching in CPORMetaPlanner.build_plan_graph, not
+        #     by this online step chooser), so classical/KT planning above can
+        #     never discover it. If one is directly applicable, take it.
+        for name in sorted(self.dynamic_actions):
+            act = self.dynamic_actions[name]
+            if act.is_nondet and act.preconditions <= current_facts:
+                return act, belief
 
         # 3. Nothing usable: explore by sensing a currently-unknown fluent that is
         #    directly applicable now.
@@ -584,33 +640,146 @@ class CPORMetaPlanner:
         self.online_planner = online_planner
         self.visited_beliefs = {}
 
+        # Sec 5.4 belief-equivalence plan-graph compaction: reuse a
+        # structurally- (and, after a regression-consistency check)
+        # semantically-equivalent CLOSED node instead of only exact belief
+        # signatures. Backed by the C++ ClosedNodeIndex (K(n)/H(n)/O(n,l)
+        # bookkeeping, mirroring CPORLib's IsClosedState/UpdateClosedStates).
+        # Restricted to simple domains, as the paper (and the C#) requires.
+        self.compaction_enabled = getattr(online_planner, "is_simple_domain", False)
+        self.closed_index = cpor_engine.ClosedNodeIndex()
+        self._closed_node_graph = {}  # closed-node id -> the graph node it was built for
+        self._node_info = {}          # id(graph node dict) -> its ClosedNodeInfo dict
+
+        # Sec 5.7 ancestor-based cycle detection for non-deterministic domains,
+        # backed by the C++ AncestorCycleGuard (mirrors the C#'s AlreadyVisited/
+        # DetectInfiniteLoop(Complete)). Only meaningful (and only enabled) when
+        # the domain actually has non-deterministic actions -- in deterministic
+        # domains there can be no cycles (paper Sec 2.3).
+        self.cycle_detection_enabled = getattr(online_planner, "has_nondet_actions", False)
+        self.cycle_guard = cpor_engine.AncestorCycleGuard()
+        self._ancestor_nodes = []  # parallel stack of node dicts, index = cycle_guard depth
+
     def make_initial_belief(self, initial_true_facts):
         """Build the root Belief by enumerating all valid initial models ONCE."""
         known_pos = {f for f in initial_true_facts if not f.startswith("NOT_")}
         models = self.online_planner.sat_solver.enumerate_models(list(initial_true_facts), 4000)
-        
+
         worlds = []
         for m in models:
             worlds.append(known_pos | set(m))
-            
+
         if not worlds:
             worlds = [known_pos]
-            
+
         return RegressionBelief(self.online_planner.sat_solver, worlds)
 
-    def build_plan_graph(self, belief):
-        # Regression-based: reasoning happens at the initial layer (see
-        # RegressionBelief). A sensing action expands both observation outcomes;
-        # an impossible outcome (observe() -> None) is a DEAD END leaf, but since
-        # get_next_action only senses currently-unknown fluents, both outcomes are
-        # normally possible -> every reachable branch reaches the goal.
+    def _known_and_hidden(self, belief):
+        """F(n) split into the full known-literal set (K-candidate universe)
+        and the base names of fluents genuinely unknown at n (H-candidate
+        universe), per Sec 5.1's belief-state definitions."""
+        known = set(belief.current_true_facts())
+        hidden = set()
+        for f in self.online_planner.sat_solver.unknown_facts:
+            value = belief.known_value(f)
+            if value is True:
+                known.add(f)
+            elif value is False:
+                known.add("NOT_" + f)
+            else:
+                hidden.add(f)
+        return known, hidden
+
+    @staticmethod
+    def _literal_holds_after(worlds, extra_literals, literal):
+        """Algorithm 3 lines 8-11: would `literal` hold in every one of `worlds`
+        consistent with also observing every literal in `extra_literals`?
+        Vacuously True if no world survives the filter (that observation
+        combination cannot occur along this branch, so it cannot violate the
+        match either)."""
+        def matches(world, lit):
+            neg = lit.startswith("NOT_")
+            base = lit[4:] if neg else lit
+            return (base not in world) if neg else (base in world)
+
+        filtered = [w for w in worlds if all(matches(w, o) for o in extra_literals)]
+        if not filtered:
+            return True
+        return all(matches(w, literal) for w in filtered)
+
+    def _find_equivalent_closed_node(self, belief, known, hidden):
+        """Algorithm 3 (GetClosedNode): a structurally-compatible closed node
+        (K(n') subseteq known, H(n') subseteq hidden) whose recorded
+        observation-set reasoning still holds against this belief's possible
+        worlds. Returns the closed-node id, or None."""
+        if not self.compaction_enabled:
+            return None
+        for match in self.closed_index.find_candidates(list(known), list(hidden)):
+            candidate = self.closed_index.info(match["id"])
+            observation_sets = candidate["observation_sets"]
+            if all(
+                self._literal_holds_after(belief.worlds, obs_set, lit)
+                for lit in match["pending_literals"]
+                for obs_set in observation_sets.get(lit, [])
+            ):
+                return match["id"]
+        return None
+
+    def _register_closed_node(self, node, info):
+        node_id = self.closed_index.register(info)
+        self._closed_node_graph[node_id] = node
+        self._node_info[id(node)] = info
+
+    def _goal_closed_info(self, known):
+        goal_literals = [name if pol else "NOT_" + name
+                         for name, pol in self.online_planner.goal_literals]
+        return cpor_engine.closed_node_goal([l for l in goal_literals if l in known])
+
+    def build_plan_graph(self, belief, via_observation=False):
+        # Worlds-based belief: RegressionBelief.worlds is the exact set of
+        # possible worlds consistent with everything observed so far. A
+        # sensing action expands both observation outcomes; an impossible
+        # outcome (observe() -> None) is a DEAD END leaf, but since
+        # get_next_action only senses currently-unknown fluents, both outcomes
+        # are normally possible -> every reachable branch reaches the goal.
+        #
+        # `via_observation`: was the edge INTO this node (from build_plan_graph's
+        # caller) a branching/information-revealing one -- a sensing observation
+        # OR a non-deterministic outcome (Sec 5.7 treats learning which outcome
+        # occurred as informative, same as an observation)? Used by the
+        # ancestor-cycle check below.
         current_facts = belief.current_true_facts()
+
+        # Sec 5.7 (Algorithm 5): for non-deterministic domains, check this
+        # BEFORE the exact-signature memo -- belief-state repetition is the
+        # exception, not the rule, in non-deterministic domains, so this is
+        # the mechanism actually doing the cycle-avoidance work here, not a
+        # backstop for the exact memo.
+        if self.cycle_detection_enabled:
+            ancestor_depth = self.cycle_guard.find_ancestor_match(sorted(current_facts))
+            if ancestor_depth is not None and (via_observation or self.cycle_guard.safe_cycle(ancestor_depth)):
+                node = self._ancestor_nodes[ancestor_depth]
+                self.visited_beliefs[belief.signature()] = node
+                return node
 
         bs_hash = belief.signature()
         if bs_hash in self.visited_beliefs:
             return self.visited_beliefs[bs_hash]
+
         if self.online_planner.is_goal_facts(current_facts):
-            return {"action": "GOAL REACHED", "children": []}
+            node = {"action": "GOAL REACHED", "children": []}
+            self.visited_beliefs[bs_hash] = node
+            if self.compaction_enabled:
+                known, _hidden = self._known_and_hidden(belief)
+                self._register_closed_node(node, self._goal_closed_info(known))
+            return node
+
+        known, hidden = self._known_and_hidden(belief)
+        equivalent_id = self._find_equivalent_closed_node(belief, known, hidden)
+        if equivalent_id is not None:
+            node = self._closed_node_graph[equivalent_id]
+            self.visited_beliefs[bs_hash] = node
+            return node
 
         action, belief = self.online_planner.get_next_action(belief)
         if action is None:
@@ -618,23 +787,59 @@ class CPORMetaPlanner:
 
         node = {"action": action.name, "children": []}
         self.visited_beliefs[bs_hash] = node
+        is_nondet = getattr(action, "is_nondet", False)
 
-        if action.is_sensing:
-            obs = action.observe
-            for value, label in ((obs, f"Observed: {obs} == True"),
-                                 (f"NOT_{obs}", f"Observed: {obs} == False")):
-                next_belief = belief.observe(value)
-                if next_belief is None:
-                    child = {"action": "DEAD END", "children": []}
-                else:
-                    # SDR: replan at every observation. Clear the committed plan so
-                    # each branch re-determinizes from its own belief, instead of
-                    # following the sample world's plan into a diverging branch
-                    # (which caused re-sensing and impossible-branch dead ends).
-                    child = self.build_plan_graph(next_belief.with_plan(()))
-                node["children"].append((label, child))
-        else:
-            child = self.build_plan_graph(belief.progress(action))
-            node["children"].append(("Deterministically", child))
+        if self.cycle_detection_enabled:
+            self.cycle_guard.push(sorted(current_facts), via_observation)
+            self._ancestor_nodes.append(node)
+
+        try:
+            if action.is_sensing:
+                obs = action.observe
+                child_info = {}
+                for value, label, key in ((obs, f"Observed: {obs} == True", True),
+                                           (f"NOT_{obs}", f"Observed: {obs} == False", False)):
+                    next_belief = belief.observe(value)
+                    if next_belief is None:
+                        child = {"action": "DEAD END", "children": []}
+                    else:
+                        # SDR: replan at every observation. Clear the committed plan so
+                        # each branch re-determinizes from its own belief, instead of
+                        # following the sample world's plan into a diverging branch
+                        # (which caused re-sensing and impossible-branch dead ends).
+                        child = self.build_plan_graph(next_belief.with_plan(()), via_observation=True)
+                    node["children"].append((label, child))
+                    child_info[key] = self._node_info.get(id(child))
+
+                if self.compaction_enabled and not is_nondet and child_info[True] and child_info[False]:
+                    info = cpor_engine.closed_node_update_sensing(
+                        child_info[True], child_info[False], list(action.preconditions), obs)
+                    self._register_closed_node(node, info)
+
+            elif is_nondet:
+                # Sec 5.7: branch once per possible outcome, exactly like a
+                # sensing observation branches once per possible value. No
+                # Sec 5.4 compaction here -- that mechanism is restricted to
+                # simple (deterministic) domains.
+                for idx in range(len(action.nondet_outcomes)):
+                    next_belief = belief.progress_nondet(action, idx).with_plan(())
+                    child = self.build_plan_graph(next_belief, via_observation=True)
+                    node["children"].append((f"Outcome {idx}", child))
+
+            else:
+                child = self.build_plan_graph(belief.progress(action), via_observation=False)
+                node["children"].append(("Deterministically", child))
+
+                if self.compaction_enabled and not is_nondet:
+                    child_info = self._node_info.get(id(child))
+                    if child_info is not None:
+                        effects = list(action.add_effects) + ["NOT_" + d for d in action.del_effects]
+                        info = cpor_engine.closed_node_update_action(
+                            child_info, list(action.preconditions), effects)
+                        self._register_closed_node(node, info)
+        finally:
+            if self.cycle_detection_enabled:
+                self.cycle_guard.pop()
+                self._ancestor_nodes.pop()
 
         return node

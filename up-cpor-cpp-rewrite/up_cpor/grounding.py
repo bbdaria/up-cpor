@@ -60,7 +60,18 @@ def _collect_fnode_literals(node, out):
         out.append((node, True))
 
 
-def ground_actions(problem):
+def ground_actions(problem, nondet_effects=None):
+    """`nondet_effects`: optional {lifted_action_name: [outcome_1, outcome_2, ...]}
+    where each outcome is a list of (ground_fluent_name, is_add) literals (Sec
+    5.7's non-deterministic actuation actions, psi as an explicit outcome list
+    rather than a DNF formula). There is no PDDL/unified_planning pathway for
+    non-deterministic effects (confirmed: the pinned PDDLReader only parses
+    `oneof` for initial-state uncertainty), so this is a side-channel supplied
+    directly by the caller for actions built via the UP Python API rather than
+    parsed from PDDL text. Outcomes are used AS-IS (no parameter binding), so
+    this only supports UNPARAMETERIZED non-deterministic actions.
+    """
+    nondet_effects = nondet_effects or {}
     effect_preds = set()
     for a in problem.actions:
         for e in a.effects:
@@ -125,10 +136,26 @@ def ground_actions(problem):
             if not ok:
                 continue
 
-            # add, dele = [], []
-            # for e in action.effects:
-            #     gname = _fluent_name(e.fluent, binding)
-            #     (add if e.value.is_true() else dele).append(gname)
+            observe = _fluent_name(observed[0], binding) if is_sensing else None
+            suffix = "_" + "_".join(binding[p.name] for p in params) if params else ""
+
+            if action.name in nondet_effects:
+                # Sec 5.7: non-deterministic actuation action -- outcomes are
+                # supplied as-is (see the nondet_effects docstring above), not
+                # computed from action.effects (UP has no representation for
+                # this, so action.effects is expected to be empty/unused here).
+                infos.append({
+                    "name": action.name + suffix,
+                    "is_sensing": is_sensing,
+                    "observe": observe,
+                    "pre": dyn_pre,
+                    "add": [],
+                    "del": [],
+                    "cond": [],
+                    "nondet": [list(outcome) for outcome in nondet_effects[action.name]],
+                })
+                continue
+
             add, dele, cond = [], [], []
             for e in action.effects:
                 gname = _fluent_name(e.fluent, binding)
@@ -140,8 +167,6 @@ def ground_actions(problem):
                     ground_cond = [(g, pol) for (_, g, pol) in cond_lits]
                     cond.append((ground_cond, gname, e.value.is_true()))
 
-            observe = _fluent_name(observed[0], binding) if is_sensing else None
-            suffix = "_" + "_".join(binding[p.name] for p in params) if params else ""
             infos.append({
                 "name": action.name + suffix,
                 "is_sensing": is_sensing,
@@ -149,6 +174,7 @@ def ground_actions(problem):
                 "pre": dyn_pre,
                 "add": add,
                 "del": dele,
-                "cond": cond
+                "cond": cond,
+                "nondet": None,
             })
     return infos

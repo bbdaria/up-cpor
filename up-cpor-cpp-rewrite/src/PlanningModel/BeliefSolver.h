@@ -40,6 +40,13 @@ public:
     // single coherent possible world rather than a contradictory all-true guess.
     std::optional<std::vector<std::string>> complete(const std::vector<std::string>& facts);
 
+    // True iff `base_facts` entails `literal` under the constraints (i.e. every
+    // model of base_facts also satisfies literal). Used by the plan-graph
+    // belief-equivalence check (paper Sec 5.4, Algorithm 3 lines 8-11): does
+    // observing a candidate node's recorded observation sequence, regressed to
+    // this initial layer, still force the same relevant hidden literal?
+    bool implies(const std::vector<std::string>& base_facts, const std::string& literal);
+
 private:
     z3::context ctx_;
     z3::solver solver_;

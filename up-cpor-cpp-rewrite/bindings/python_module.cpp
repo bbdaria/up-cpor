@@ -12,9 +12,13 @@
 #include "LogicalUtilities/NotNode.h"
 #include "PlanningModel/BeliefSolver.h"
 #include "PlanningModel/KTTranslator.h"
+#include "PlanningModel/PlanGraphEquivalence.h"
 #include "FF-v2.3/ff_wrapper.h"
 
 static bool py_list_to_strings(PyObject* py_list, std::vector<std::string>& out);  // fwd decl
+static PyObject* py_closed_node_goal(PyObject* self, PyObject* args);  // fwd decl
+static PyObject* py_closed_node_update_action(PyObject* self, PyObject* args);  // fwd decl
+static PyObject* py_closed_node_update_sensing(PyObject* self, PyObject* args);  // fwd decl
 
 // 0. Module-level functions
 // ff_solve(domain_path, problem_path) -> list[str]
@@ -200,6 +204,12 @@ static PyMethodDef cpor_engine_functions[] = {
      "ff_solve_strings(domain_str, problem_str) -> list[str]: run Metric-FF on in-memory PDDL."},
     {"kt_translate", (PyCFunction)py_kt_translate, METH_VARARGS,
      "kt_translate(actions, uncertain, tags, known_true, goal) -> (domain, problem): KT translation."},
+    {"closed_node_goal", (PyCFunction)py_closed_node_goal, METH_VARARGS,
+     "closed_node_goal(goal_literals_known) -> dict: K/H/O for a goal leaf (paper Sec 5.4 eq. 6)."},
+    {"closed_node_update_action", (PyCFunction)py_closed_node_update_action, METH_VARARGS,
+     "closed_node_update_action(child, preconditions, effects) -> dict: fold K/H/O through an actuation action (Algorithm 4)."},
+    {"closed_node_update_sensing", (PyCFunction)py_closed_node_update_sensing, METH_VARARGS,
+     "closed_node_update_sensing(true_child, false_child, preconditions, observed_base) -> dict: fold K/H/O through a sensing action (Algorithm 4)."},
     {NULL, NULL, 0, NULL}
 };
 
@@ -451,6 +461,16 @@ static PyObject* BeliefSolver_complete(PyBeliefSolver* self, PyObject* args) {
     return out;
 }
 
+static PyObject* BeliefSolver_implies(PyBeliefSolver* self, PyObject* args) {
+    PyObject* py_list;
+    const char* literal;
+    if (!PyArg_ParseTuple(args, "Os", &py_list, &literal)) return NULL;
+    std::vector<std::string> facts;
+    if (!py_list_to_strings(py_list, facts)) return NULL;
+    if ((*self->cpp_obj)->implies(facts, std::string(literal))) Py_RETURN_TRUE;
+    Py_RETURN_FALSE;
+}
+
 static PyMethodDef BeliefSolver_methods[] = {
     {"add_oneof", (PyCFunction)BeliefSolver_add_oneof, METH_VARARGS, "Add an exactly-one-of constraint (list of literals)"},
     {"add_clause", (PyCFunction)BeliefSolver_add_clause, METH_VARARGS, "Add a disjunctive (or) clause (list of literals)"},
@@ -458,6 +478,223 @@ static PyMethodDef BeliefSolver_methods[] = {
     {"propagate", (PyCFunction)BeliefSolver_propagate, METH_VARARGS, "Closure of given literals, or None if inconsistent"},
     {"is_consistent", (PyCFunction)BeliefSolver_is_consistent, METH_VARARGS, "Whether the given literals are satisfiable"},
     {"complete", (PyCFunction)BeliefSolver_complete, METH_VARARGS, "One satisfying model (true vars) consistent with the given literals, or None"},
+    {"implies", (PyCFunction)BeliefSolver_implies, METH_VARARGS, "implies(base_facts, literal) -> bool: does base_facts entail literal?"},
+    {NULL}
+};
+
+// 6c. Plan-graph belief-equivalence compaction + ancestor cycle detection
+// (paper Sec 5.4/5.7; see src/PlanningModel/PlanGraphEquivalence.h)
+static bool py_to_closed_node_info(PyObject* py_dict, PlanGraph::ClosedNodeInfo& out) {
+    if (!PyDict_Check(py_dict)) { PyErr_SetString(PyExc_TypeError, "expected a dict"); return false; }
+
+    PyObject* known = PyDict_GetItemString(py_dict, "known");
+    PyObject* hidden = PyDict_GetItemString(py_dict, "hidden");
+    PyObject* obs = PyDict_GetItemString(py_dict, "observation_sets");
+
+    std::vector<std::string> known_v, hidden_v;
+    if (known && !py_list_to_strings(known, known_v)) return false;
+    if (hidden && !py_list_to_strings(hidden, hidden_v)) return false;
+    out.known = std::set<std::string>(known_v.begin(), known_v.end());
+    out.hidden = std::set<std::string>(hidden_v.begin(), hidden_v.end());
+
+    if (obs) {
+        if (!PyDict_Check(obs)) { PyErr_SetString(PyExc_TypeError, "observation_sets must be a dict"); return false; }
+        PyObject *key, *value;
+        Py_ssize_t pos = 0;
+        while (PyDict_Next(obs, &pos, &key, &value)) {
+            if (!PyUnicode_Check(key)) { PyErr_SetString(PyExc_TypeError, "observation_sets keys must be str"); return false; }
+            std::string lit = PyUnicode_AsUTF8(key);
+            if (!PyList_Check(value)) { PyErr_SetString(PyExc_TypeError, "observation_sets values must be lists"); return false; }
+            for (Py_ssize_t i = 0; i < PyList_Size(value); i++) {
+                std::vector<std::string> one_set;
+                if (!py_list_to_strings(PyList_GetItem(value, i), one_set)) return false;
+                out.observation_sets[lit].push_back(std::move(one_set));
+            }
+        }
+    }
+    return true;
+}
+
+static PyObject* closed_node_info_to_py(const PlanGraph::ClosedNodeInfo& info) {
+    PyObject* known = PyList_New(0);
+    for (const auto& k : info.known) PyList_Append(known, PyUnicode_FromString(k.c_str()));
+    PyObject* hidden = PyList_New(0);
+    for (const auto& h : info.hidden) PyList_Append(hidden, PyUnicode_FromString(h.c_str()));
+    PyObject* obs = PyDict_New();
+    for (const auto& kv : info.observation_sets) {
+        PyObject* sets = PyList_New(0);
+        for (const auto& one_set : kv.second) {
+            PyObject* set_list = PyList_New(0);
+            for (const auto& lit : one_set) PyList_Append(set_list, PyUnicode_FromString(lit.c_str()));
+            PyList_Append(sets, set_list);
+            Py_DECREF(set_list);
+        }
+        PyDict_SetItemString(obs, kv.first.c_str(), sets);
+        Py_DECREF(sets);
+    }
+    PyObject* d = PyDict_New();
+    PyDict_SetItemString(d, "known", known);
+    PyDict_SetItemString(d, "hidden", hidden);
+    PyDict_SetItemString(d, "observation_sets", obs);
+    Py_DECREF(known); Py_DECREF(hidden); Py_DECREF(obs);
+    return d;
+}
+
+// closed_node_goal(goal_literals_known) -> dict
+static PyObject* py_closed_node_goal(PyObject* self, PyObject* args) {
+    PyObject* py_list;
+    if (!PyArg_ParseTuple(args, "O", &py_list)) return NULL;
+    std::vector<std::string> lits;
+    if (!py_list_to_strings(py_list, lits)) return NULL;
+    return closed_node_info_to_py(PlanGraph::ClosedNodeIndex::goal_node(lits));
+}
+
+// closed_node_update_action(child, preconditions, effects) -> dict
+static PyObject* py_closed_node_update_action(PyObject* self, PyObject* args) {
+    PyObject *py_child, *py_pre, *py_eff;
+    if (!PyArg_ParseTuple(args, "OOO", &py_child, &py_pre, &py_eff)) return NULL;
+    PlanGraph::ClosedNodeInfo child;
+    if (!py_to_closed_node_info(py_child, child)) return NULL;
+    std::vector<std::string> pre, eff;
+    if (!py_list_to_strings(py_pre, pre)) return NULL;
+    if (!py_list_to_strings(py_eff, eff)) return NULL;
+    return closed_node_info_to_py(PlanGraph::ClosedNodeIndex::update_action(child, pre, eff));
+}
+
+// closed_node_update_sensing(true_child, false_child, preconditions, observed_base) -> dict
+static PyObject* py_closed_node_update_sensing(PyObject* self, PyObject* args) {
+    PyObject *py_true, *py_false, *py_pre;
+    const char* observed_base;
+    if (!PyArg_ParseTuple(args, "OOOs", &py_true, &py_false, &py_pre, &observed_base)) return NULL;
+    PlanGraph::ClosedNodeInfo true_child, false_child;
+    if (!py_to_closed_node_info(py_true, true_child)) return NULL;
+    if (!py_to_closed_node_info(py_false, false_child)) return NULL;
+    std::vector<std::string> pre;
+    if (!py_list_to_strings(py_pre, pre)) return NULL;
+    return closed_node_info_to_py(PlanGraph::ClosedNodeIndex::update_sensing(
+        true_child, false_child, pre, std::string(observed_base)));
+}
+
+static PyTypeObject PyClosedNodeIndexType = { PyVarObject_HEAD_INIT(NULL, 0) };
+typedef struct { PyObject_HEAD std::shared_ptr<PlanGraph::ClosedNodeIndex>* cpp_obj; } PyClosedNodeIndex;
+
+static int PyClosedNodeIndex_init(PyClosedNodeIndex* self, PyObject* args, PyObject* kwds) {
+    self->cpp_obj = new std::shared_ptr<PlanGraph::ClosedNodeIndex>(
+        std::make_shared<PlanGraph::ClosedNodeIndex>());
+    return 0;
+}
+static void PyClosedNodeIndex_dealloc(PyClosedNodeIndex* self) {
+    if (self->cpp_obj) { delete self->cpp_obj; self->cpp_obj = nullptr; }
+    Py_TYPE(self)->tp_free((PyObject*)self);
+}
+
+// register(info: dict) -> int
+static PyObject* ClosedNodeIndex_register(PyClosedNodeIndex* self, PyObject* args) {
+    PyObject* py_info;
+    if (!PyArg_ParseTuple(args, "O", &py_info)) return NULL;
+    PlanGraph::ClosedNodeInfo info;
+    if (!py_to_closed_node_info(py_info, info)) return NULL;
+    std::size_t id = (*self->cpp_obj)->register_node(std::move(info));
+    return PyLong_FromSize_t(id);
+}
+
+// find_candidates(known: list[str], hidden: list[str]) -> list[{"id": int, "pending_literals": list[str]}]
+static PyObject* ClosedNodeIndex_find_candidates(PyClosedNodeIndex* self, PyObject* args) {
+    PyObject *py_known, *py_hidden;
+    if (!PyArg_ParseTuple(args, "OO", &py_known, &py_hidden)) return NULL;
+    std::vector<std::string> known_v, hidden_v;
+    if (!py_list_to_strings(py_known, known_v)) return NULL;
+    if (!py_list_to_strings(py_hidden, hidden_v)) return NULL;
+    std::set<std::string> known(known_v.begin(), known_v.end());
+    std::set<std::string> hidden(hidden_v.begin(), hidden_v.end());
+
+    auto matches = (*self->cpp_obj)->find_candidates(known, hidden);
+    PyObject* out = PyList_New(0);
+    for (const auto& m : matches) {
+        PyObject* pending = PyList_New(0);
+        for (const auto& lit : m.pending_literals) PyList_Append(pending, PyUnicode_FromString(lit.c_str()));
+        PyObject* d = PyDict_New();
+        PyDict_SetItemString(d, "id", PyLong_FromSize_t(m.id));
+        PyDict_SetItemString(d, "pending_literals", pending);
+        Py_DECREF(pending);
+        PyList_Append(out, d);
+        Py_DECREF(d);
+    }
+    return out;
+}
+
+// info(id: int) -> dict
+static PyObject* ClosedNodeIndex_info(PyClosedNodeIndex* self, PyObject* args) {
+    Py_ssize_t id;
+    if (!PyArg_ParseTuple(args, "n", &id)) return NULL;
+    try {
+        return closed_node_info_to_py((*self->cpp_obj)->info(static_cast<std::size_t>(id)));
+    } catch (const std::out_of_range&) {
+        PyErr_SetString(PyExc_IndexError, "no closed node with that id");
+        return NULL;
+    }
+}
+
+static PyMethodDef ClosedNodeIndex_methods[] = {
+    {"register", (PyCFunction)ClosedNodeIndex_register, METH_VARARGS, "register(info: dict) -> int: register a closed node's K/H/O"},
+    {"find_candidates", (PyCFunction)ClosedNodeIndex_find_candidates, METH_VARARGS,
+     "find_candidates(known, hidden) -> list[{id, pending_literals}]: structurally-compatible closed nodes"},
+    {"info", (PyCFunction)ClosedNodeIndex_info, METH_VARARGS, "info(id) -> dict: the K/H/O of a registered node"},
+    {NULL}
+};
+
+static PyTypeObject PyAncestorCycleGuardType = { PyVarObject_HEAD_INIT(NULL, 0) };
+typedef struct { PyObject_HEAD std::shared_ptr<PlanGraph::AncestorCycleGuard>* cpp_obj; } PyAncestorCycleGuard;
+
+static int PyAncestorCycleGuard_init(PyAncestorCycleGuard* self, PyObject* args, PyObject* kwds) {
+    self->cpp_obj = new std::shared_ptr<PlanGraph::AncestorCycleGuard>(
+        std::make_shared<PlanGraph::AncestorCycleGuard>());
+    return 0;
+}
+static void PyAncestorCycleGuard_dealloc(PyAncestorCycleGuard* self) {
+    if (self->cpp_obj) { delete self->cpp_obj; self->cpp_obj = nullptr; }
+    Py_TYPE(self)->tp_free((PyObject*)self);
+}
+
+static PyObject* AncestorCycleGuard_push(PyAncestorCycleGuard* self, PyObject* args) {
+    PyObject* py_facts;
+    int crossed;
+    if (!PyArg_ParseTuple(args, "Op", &py_facts, &crossed)) return NULL;
+    std::vector<std::string> facts;
+    if (!py_list_to_strings(py_facts, facts)) return NULL;
+    (*self->cpp_obj)->push(std::move(facts), crossed != 0);
+    Py_RETURN_NONE;
+}
+
+static PyObject* AncestorCycleGuard_pop(PyAncestorCycleGuard* self, PyObject* args) {
+    (*self->cpp_obj)->pop();
+    Py_RETURN_NONE;
+}
+
+static PyObject* AncestorCycleGuard_find_ancestor_match(PyAncestorCycleGuard* self, PyObject* args) {
+    PyObject* py_facts;
+    if (!PyArg_ParseTuple(args, "O", &py_facts)) return NULL;
+    std::vector<std::string> facts;
+    if (!py_list_to_strings(py_facts, facts)) return NULL;
+    auto match = (*self->cpp_obj)->find_ancestor_match(facts);
+    if (!match.has_value()) Py_RETURN_NONE;
+    return PyLong_FromSize_t(*match);
+}
+
+static PyObject* AncestorCycleGuard_safe_cycle(PyAncestorCycleGuard* self, PyObject* args) {
+    Py_ssize_t depth;
+    if (!PyArg_ParseTuple(args, "n", &depth)) return NULL;
+    if ((*self->cpp_obj)->safe_cycle(static_cast<std::size_t>(depth))) Py_RETURN_TRUE;
+    Py_RETURN_FALSE;
+}
+
+static PyMethodDef AncestorCycleGuard_methods[] = {
+    {"push", (PyCFunction)AncestorCycleGuard_push, METH_VARARGS, "push(known_facts, crossed_observation)"},
+    {"pop", (PyCFunction)AncestorCycleGuard_pop, METH_NOARGS, "pop()"},
+    {"find_ancestor_match", (PyCFunction)AncestorCycleGuard_find_ancestor_match, METH_VARARGS,
+     "find_ancestor_match(known_facts) -> int|None: stack depth of a matching ancestor"},
+    {"safe_cycle", (PyCFunction)AncestorCycleGuard_safe_cycle, METH_VARARGS,
+     "safe_cycle(ancestor_depth) -> bool: an observation was crossed since that ancestor"},
     {NULL}
 };
 
@@ -477,9 +714,12 @@ PyMODINIT_FUNC PyInit_cpor_engine(void) {
     PyOrNodeType.tp_name = "cpor_engine.OrNode"; PyOrNodeType.tp_basicsize = sizeof(PyOrNode); PyOrNodeType.tp_dealloc = (destructor)PyOrNode_dealloc; PyOrNodeType.tp_methods = ASTNode_methods; PyOrNodeType.tp_init = (initproc)PyOrNode_init; PyOrNodeType.tp_new = PyType_GenericNew; PyOrNodeType.tp_flags = Py_TPFLAGS_DEFAULT;
     PyNotNodeType.tp_name = "cpor_engine.NotNode"; PyNotNodeType.tp_basicsize = sizeof(PyNotNode); PyNotNodeType.tp_dealloc = (destructor)PyNotNode_dealloc; PyNotNodeType.tp_methods = ASTNode_methods; PyNotNodeType.tp_init = (initproc)PyNotNode_init; PyNotNodeType.tp_new = PyType_GenericNew; PyNotNodeType.tp_flags = Py_TPFLAGS_DEFAULT;
     PyBeliefSolverType.tp_name = "cpor_engine.BeliefSolver"; PyBeliefSolverType.tp_basicsize = sizeof(PyBeliefSolver); PyBeliefSolverType.tp_dealloc = (destructor)PyBeliefSolver_dealloc; PyBeliefSolverType.tp_methods = BeliefSolver_methods; PyBeliefSolverType.tp_init = (initproc)PyBeliefSolver_init; PyBeliefSolverType.tp_new = PyType_GenericNew; PyBeliefSolverType.tp_flags = Py_TPFLAGS_DEFAULT;
+    PyClosedNodeIndexType.tp_name = "cpor_engine.ClosedNodeIndex"; PyClosedNodeIndexType.tp_basicsize = sizeof(PyClosedNodeIndex); PyClosedNodeIndexType.tp_dealloc = (destructor)PyClosedNodeIndex_dealloc; PyClosedNodeIndexType.tp_methods = ClosedNodeIndex_methods; PyClosedNodeIndexType.tp_init = (initproc)PyClosedNodeIndex_init; PyClosedNodeIndexType.tp_new = PyType_GenericNew; PyClosedNodeIndexType.tp_flags = Py_TPFLAGS_DEFAULT;
+    PyAncestorCycleGuardType.tp_name = "cpor_engine.AncestorCycleGuard"; PyAncestorCycleGuardType.tp_basicsize = sizeof(PyAncestorCycleGuard); PyAncestorCycleGuardType.tp_dealloc = (destructor)PyAncestorCycleGuard_dealloc; PyAncestorCycleGuardType.tp_methods = AncestorCycleGuard_methods; PyAncestorCycleGuardType.tp_init = (initproc)PyAncestorCycleGuard_init; PyAncestorCycleGuardType.tp_new = PyType_GenericNew; PyAncestorCycleGuardType.tp_flags = Py_TPFLAGS_DEFAULT;
     if (PyType_Ready(&PyPredicateType) < 0 || PyType_Ready(&PyPredicateNodeType) < 0 ||
         PyType_Ready(&PyAndNodeType) < 0 || PyType_Ready(&PyOrNodeType) < 0 ||
-        PyType_Ready(&PyNotNodeType) < 0 || PyType_Ready(&PyBeliefSolverType) < 0) return NULL;
+        PyType_Ready(&PyNotNodeType) < 0 || PyType_Ready(&PyBeliefSolverType) < 0 ||
+        PyType_Ready(&PyClosedNodeIndexType) < 0 || PyType_Ready(&PyAncestorCycleGuardType) < 0) return NULL;
 
     PyObject* m = PyModule_Create(&cpor_engine_module);
     if (!m) return NULL;
@@ -490,6 +730,8 @@ PyMODINIT_FUNC PyInit_cpor_engine(void) {
     Py_INCREF(&PyOrNodeType); PyModule_AddObject(m, "OrNode", (PyObject *)&PyOrNodeType);
     Py_INCREF(&PyNotNodeType); PyModule_AddObject(m, "NotNode", (PyObject *)&PyNotNodeType);
     Py_INCREF(&PyBeliefSolverType); PyModule_AddObject(m, "BeliefSolver", (PyObject *)&PyBeliefSolverType);
+    Py_INCREF(&PyClosedNodeIndexType); PyModule_AddObject(m, "ClosedNodeIndex", (PyObject *)&PyClosedNodeIndexType);
+    Py_INCREF(&PyAncestorCycleGuardType); PyModule_AddObject(m, "AncestorCycleGuard", (PyObject *)&PyAncestorCycleGuardType);
 
     return m;
 }
