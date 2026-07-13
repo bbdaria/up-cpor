@@ -758,3 +758,11 @@ up-cpor-papers/3488903.pdf
 .gitignore
 .gitignore
 up-cpor-papers/1401.6048v1.pdf
+tests/localize5noisy/d.pddl
+.gitignore
+tests/medpks010/d.pddl
+.gitignore
+tests/wumpus10/p.pddl
+tests/wumpus10/d.pddl
+tests/medpks010/p.pddl
+tests/localize5noisy/p.pddl

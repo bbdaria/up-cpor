@@ -604,6 +604,17 @@ class NativeSDRImpl:
             g, pol = lit_pair
             return ("NOT_" + g) if pol else g
 
+        # Sound only when the when-clauses functionally DETERMINE the fluent
+        # from the hidden variable: every member of the oneof group must fix
+        # the fluent's value via some clause (localize5's checking covers all
+        # 19 positions, both polarities). A one-sided clause set (medpks:
+        # ill_ik -> stain_sk, nothing ever forces a stain false) does NOT
+        # determine the fluent -- it is genuinely dynamic (false until the
+        # action runs), and asserting the implication as a static axiom is
+        # both wrong and inflates the unknown-fact set past the
+        # world-enumeration cap (medpks: 11 worlds -> >4000 truncated).
+        member_group = {m: tuple(g) for g in self.sat_solver.oneof_groups for m in g}
+        candidate_axioms = {}  # fluent -> {clauses, covered members, groups, determinable}
         for info in self.kt_action_info:
             for cond_lits, fluent, is_add in info.get("cond", []):
                 if fluent in self.sat_solver.oneof_members:
@@ -612,9 +623,21 @@ class NativeSDRImpl:
                                if g in self.sat_solver.unknown_facts]
                 if not hidden_lits:
                     continue
+                entry = candidate_axioms.setdefault(
+                    fluent, {"clauses": [], "covered": set(), "groups": set(), "ok": True})
+                if len(hidden_lits) == 1 and hidden_lits[0][1] and hidden_lits[0][0] in member_group:
+                    member = hidden_lits[0][0]
+                    entry["covered"].add(member)
+                    entry["groups"].add(member_group[member])
+                else:
+                    entry["ok"] = False  # compound/negative condition: can't show determination
                 target = fluent if is_add else ("NOT_" + fluent)
-                clause = [_neg(lit) for lit in hidden_lits] + [target]
-                self.sat_solver.add_hidden_clause(fluent, clause)
+                entry["clauses"].append([_neg(lit) for lit in hidden_lits] + [target])
+        for fluent, entry in candidate_axioms.items():
+            if entry["ok"] and entry["groups"] and all(
+                    set(g) <= entry["covered"] for g in entry["groups"]):
+                for clause in entry["clauses"]:
+                    self.sat_solver.add_hidden_clause(fluent, clause)
 
         # Goals and the fluent->FNode map come from the (ungrounded) problem: goals
         # are already ground and initial_values enumerates every ground fluent.
