@@ -46,11 +46,10 @@ public:
     const ClosedNodeInfo& info(std::size_t id) const;
     std::size_t size() const { return nodes_.size(); }
 
-    // Algorithm 3 lines 5-7 (the structural pre-filter): `known`/`hidden`
-    // describe the CURRENT node (its full known-literal set, and the base names
-    // of fluents currently unknown). Returns every registered node whose
-    // K(n') is contained in `known` and whose H(n') fluents are all still
-    // unknown at the current node.
+    // Algorithm 3 lines 5-7 (structural pre-filter): `known`/`hidden`
+    // describe the current node (full known-literal set + base names of
+    // fluents still unknown). Returns every registered node whose K(n') is
+    // contained in `known` and whose H(n') fluents are all still unknown.
     std::vector<ClosedNodeMatch> find_candidates(const std::set<std::string>& known,
                                                   const std::set<std::string>& hidden) const;
 
@@ -76,13 +75,13 @@ private:
 };
 
 // Ancestor-chain cycle detection for non-deterministic domains (Sec 5.7). The
-// caller pushes one frame per node on the CURRENT recursion path (mirroring
-// walking `Predecessor` in the C#'s DetectInfiniteLoop) and pops it on return.
+// caller pushes one frame per node on the current recursion path (the C#
+// walks `Predecessor` in DetectInfiniteLoop) and pops it on return.
 class AncestorCycleGuard {
 public:
     // `known_facts` = the node's full known-literal set (same convention as
     // ClosedNodeInfo::known); `crossed_observation` = true iff the edge from
-    // the PARENT frame to this one was a sensing/observation edge.
+    // the parent frame to this one was a sensing/observation edge.
     void push(std::vector<std::string> known_facts, bool crossed_observation);
     void pop();
 
@@ -90,10 +89,9 @@ public:
     // ancestor currently on the stack? Returns its stack depth (0 = root) if so.
     std::optional<std::size_t> find_ancestor_match(const std::vector<std::string>& known_facts) const;
 
-    // True iff at least one observation was crossed strictly between the
-    // ancestor at `ancestor_depth` and the top of the stack -- i.e. this is a
-    // genuine (informative) cycle, not the C#'s explicit deadend self-loop
-    // (an action re-applied with no intervening sensing action).
+    // True iff an observation was crossed strictly between the ancestor at
+    // `ancestor_depth` and the top of the stack, i.e. a genuine informative
+    // cycle rather than an action re-applied with no intervening sensing.
     bool safe_cycle(std::size_t ancestor_depth) const;
 
     std::size_t depth() const { return frames_.size(); }

@@ -72,8 +72,8 @@ ClosedNodeInfo ClosedNodeIndex::update_sensing(const ClosedNodeInfo& true_child,
     const std::string not_q = "NOT_" + observed_base;
 
     // K(n) = K(true)+K(false)+pre(n.a), minus the literal this action itself
-    // determines (its value is only relevant to CHOOSE a branch, not before it;
-    // Algorithm 4, eq. 11).
+    // determines -- its value only picks the branch, it isn't known before
+    // (Algorithm 4, eq. 11).
     for (const auto& k : true_child.known)
         if (k != observed_base && k != not_q) out.known.insert(k);
     for (const auto& k : false_child.known)
@@ -149,10 +149,9 @@ std::optional<std::size_t> AncestorCycleGuard::find_ancestor_match(
 }
 
 bool AncestorCycleGuard::safe_cycle(std::size_t ancestor_depth) const {
-    // An observation must occur on some edge STRICTLY between the ancestor and
-    // the current (top) frame -- i.e. on frames [ancestor_depth+1, end).
-    // Mirrors the C#'s DetectInfiniteLoop: a self-loop with no intervening
-    // sensing action is a deadend, not a compactable cycle.
+    // An observation must occur strictly between the ancestor and the top
+    // frame, i.e. on frames [ancestor_depth+1, end). C# DetectInfiniteLoop:
+    // a self-loop with no intervening sensing is a dead end, not a cycle.
     for (std::size_t i = ancestor_depth + 1; i < frames_.size(); ++i) {
         if (frames_[i].crossed_observation) return true;
     }

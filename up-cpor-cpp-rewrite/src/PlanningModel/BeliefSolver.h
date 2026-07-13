@@ -35,9 +35,9 @@ public:
     // True iff the given literals are jointly satisfiable with the constraints.
     bool is_consistent(const std::vector<std::string>& facts);
 
-    // One satisfying assignment consistent with `facts`: the constraint variables
-    // that are TRUE in the model. nullopt if unsatisfiable. Used to plan for a
-    // single coherent possible world rather than a contradictory all-true guess.
+    // One satisfying assignment consistent with `facts`: the constraint
+    // variables true in the model, or nullopt if unsatisfiable. Used to plan
+    // for a coherent possible world rather than an all-true guess.
     std::optional<std::vector<std::string>> complete(const std::vector<std::string>& facts);
 
     // True iff `base_facts` entails `literal` under the constraints (i.e. every

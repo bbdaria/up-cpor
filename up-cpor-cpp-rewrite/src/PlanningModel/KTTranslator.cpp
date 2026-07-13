@@ -26,9 +26,21 @@ std::string k_atom(const std::string& fluent, bool positive) {
     return san(kp->get_name());
 }
 
+// "Learn that `fluent` is `positive`": assert the matching K-literal and
+// withdraw the opposite one, as one space-joined effect fragment.
+std::string k_update(const std::string& fluent, bool positive) {
+    return "(" + k_atom(fluent, positive) + ") (not (" + k_atom(fluent, !positive) + "))";
+}
+
 std::string tag_atom(int i, const std::string& fluent) {
     return "c" + std::to_string(i) + "_" + san(fluent);
 }
+
+// Cap on (derived conditional effects x tags) expanded tag-wise per action.
+// Sibling of the Python-side tractability knobs (NativeSDRImpl.MODEL_ENUM_CAP,
+// KT_MAX_TAGS): past it the translation degrades to knowledge-level whens
+// only, which weakens -- not invalidates -- the plans FF can find.
+constexpr int kMaxTagWiseWhens = 600;
 
 std::string tag_lit(int i, const std::string& fluent, bool positive) {
     std::string a = "(" + tag_atom(i, fluent) + ")";
@@ -119,20 +131,18 @@ std::pair<std::string, std::string> kt_translate(
     }
     for (int i = 0; i < n_tags; ++i) preds.insert("(ref_" + std::to_string(i) + ")");
 
-    // Full effect of setting/clearing `f`: knowledge (with the opposite
-    // K-literal withdrawn) plus, for tag-tracked fluents, every tag copy --
-    // an unconditional actuation effect applies in all possible worlds.
-    auto full_effect = [&](const std::string& f, bool is_add) {
-        std::vector<std::string> out;
+    // Append the full effect of setting/clearing `f`: knowledge (with the
+    // opposite K-literal withdrawn) plus, for tag-tracked fluents, every tag
+    // copy -- an unconditional actuation effect applies in all possible worlds.
+    auto append_full_effect = [&](const std::string& f, bool is_add,
+                                  std::vector<std::string>& out) {
         if (tagged.count(f)) {
-            out.push_back("(" + k_atom(f, is_add) + ")");
-            out.push_back("(not (" + k_atom(f, !is_add) + "))");
+            out.push_back(k_update(f, is_add));
             for (int i = 0; i < n_tags; ++i) out.push_back(tag_lit(i, f, is_add));
         } else {
             preds.insert("(" + san(f) + ")");
             out.push_back(is_add ? "(" + san(f) + ")" : "(not (" + san(f) + "))");
         }
-        return out;
     };
 
     std::vector<std::string> blocks;
@@ -146,25 +156,20 @@ std::pair<std::string, std::string> kt_translate(
 
         if (!a.is_sensing) {
             std::vector<std::string> eff;
-            for (const auto& f : a.add)
-                for (const auto& e : full_effect(f, true)) eff.push_back(e);
-            for (const auto& f : a.del)
-                for (const auto& e : full_effect(f, false)) eff.push_back(e);
+            for (const auto& f : a.add) append_full_effect(f, true, eff);
+            for (const auto& f : a.del) append_full_effect(f, false, eff);
 
-            // Tag-wise expansion is emitted ONLY for effects whose target is
-            // a DERIVED fluent: those are the tag copies that sensing reads
-            // dynamically (medpks' stain_sk), so they must track each world.
-            // For uncertain targets the copies are never read back mid-plan
-            // (uncertain sensing bakes the sample value in at translation
-            // time), so the knowledge-level when alone suffices -- and
-            // expanding them anyway multiplies every operator's effect list
-            // by n_tags, which blows up FF's grounding and search (localize5:
-            // 8 move whens x 19 tags made most seeds time out). A product cap
-            // additionally guards FF against very large derived expansions.
+            // Tag-wise expansion is emitted only for effects with a derived
+            // target: those tag copies are read back dynamically by sensing,
+            // so they must track each world. Uncertain targets' copies are
+            // never read back mid-plan (their sensing bakes the sample value
+            // in at translation time), and expanding them anyway multiplies
+            // every operator's effect list by n_tags, blowing up FF.
             int derived_conds = 0;
             for (const auto& c : a.cond)
                 if (derived.count(std::get<1>(c))) ++derived_conds;
-            const bool tag_expand = derived_conds > 0 && derived_conds * n_tags <= 600;
+            const bool tag_expand =
+                derived_conds > 0 && derived_conds * n_tags <= kMaxTagWiseWhens;
 
             for (const auto& c : a.cond) {
                 const auto& cond_lits = std::get<0>(c);
@@ -184,7 +189,9 @@ std::pair<std::string, std::string> kt_translate(
                         when << " " << lit_atom(cl.first, cl.second, tagged);
                     }
                     when << ") (and";
-                    for (const auto& e : full_effect(fluent, is_add)) when << " " << e;
+                    std::vector<std::string> consequence;
+                    append_full_effect(fluent, is_add, consequence);
+                    for (const auto& e : consequence) when << " " << e;
                     when << "))";
                     eff.push_back(when.str());
                 } else {
@@ -211,8 +218,7 @@ std::pair<std::string, std::string> kt_translate(
                     kwhen << "(when (and";
                     for (const auto& cl : cond_lits)
                         kwhen << " " << lit_atom(cl.first, cl.second, tagged);
-                    kwhen << ") (and (" << k_atom(fluent, is_add) << ") (not ("
-                          << k_atom(fluent, !is_add) << "))))";
+                    kwhen << ") (and " << k_update(fluent, is_add) << "))";
                     eff.push_back(kwhen.str());
                 }
             }
@@ -237,20 +243,18 @@ std::pair<std::string, std::string> kt_translate(
                 }
                 blocks.push_back(mk_action(name, pre, eff));
             } else if (tagged.count(p)) {
-                // Tag-dependent (derived) fluent: its value changes as the
-                // plan executes, so the observed outcome is whatever holds in
-                // the sample world NOW -- condition on tag 0's copy, and
-                // refute every tag that currently disagrees with tag 0.
+                // Derived fluent: its value changes as the plan executes, so
+                // the observed outcome is whatever currently holds in the
+                // sample world. Condition on tag 0's copy and refute every
+                // tag that disagrees with it.
                 std::vector<std::string> eff;
-                eff.push_back("(when " + tag_lit(0, p, true) + " (and (" + k_atom(p, true) +
-                              ") (not (" + k_atom(p, false) + "))))");
-                eff.push_back("(when " + tag_lit(0, p, false) + " (and (" + k_atom(p, false) +
-                              ") (not (" + k_atom(p, true) + "))))");
-                for (int t = 1; t < n_tags; ++t) {
-                    eff.push_back("(when (and " + tag_lit(0, p, true) + " " + tag_lit(t, p, false) +
-                                  ") (ref_" + std::to_string(t) + "))");
-                    eff.push_back("(when (and " + tag_lit(0, p, false) + " " + tag_lit(t, p, true) +
-                                  ") (ref_" + std::to_string(t) + "))");
+                for (bool value : {true, false}) {
+                    eff.push_back("(when " + tag_lit(0, p, value) +
+                                  " (and " + k_update(p, value) + "))");
+                    for (int t = 1; t < n_tags; ++t)
+                        eff.push_back("(when (and " + tag_lit(0, p, value) + " " +
+                                      tag_lit(t, p, !value) +
+                                      ") (ref_" + std::to_string(t) + "))");
                 }
                 blocks.push_back(mk_action(name, pre, eff));
             }
