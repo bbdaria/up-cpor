@@ -1,0 +1,20 @@
+# Runtime dependencies for the C++ rewrite (up-cpor-cpp-rewrite).
+#
+# This is self-contained and does NOT need the outer C# project's deps
+# (no pythonnet / mono / dotnet): the C# engine was replaced by the
+# in-process C++/FF/Z3 module in build/cpor_engine.so.
+#
+# Install into the Python 3.12 you build the extension against:
+#     pip install -r requirements.txt
+# CMake reads the Z3 headers/libs out of the z3-solver package below, so
+# install these before running cmake.
+
+# SAT/CNF reasoning backend (BeliefSolver) and the Z3 C++ headers CMake links.
+z3-solver
+
+# Contingent-planning support. Stock unified_planning lacks
+# unified_planning.model.contingent; this fork provides it.
+unified-planning @ git+https://github.com/aiplan4eu/unified-planning@action-selector-mixin
+
+# Test runner for tests/python.
+pytest

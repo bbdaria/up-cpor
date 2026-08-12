@@ -766,3 +766,17 @@ tests/wumpus10/p.pddl
 tests/wumpus10/d.pddl
 tests/medpks010/p.pddl
 tests/localize5noisy/p.pddl
+
+# benchmarks
+benchmarks/classical-domains/
+benchmarks/results/
+benchmarks/converted/
+benchmarks/_common.py
+benchmarks/contingentize.py
+benchmarks/README.md
+benchmarks/report.py
+benchmarks/run_classical.py
+benchmarks/run_one.py
+benchmarks/run_converted.py
+up-cpor-cpp-rewrite/output.txt
+benchmarks/validate.py
